@@ -106,15 +106,22 @@ export const gstProvider = {
     return { cancelled: true, provider: cfg.provider || 'gsp' };
   },
 
-  async generateEWB({ invoice, distanceKm }) {
+  async generateEWB({ invoice, distanceKm, transportMode, vehicleNo, transporterId }) {
     const cfg = await loadGstConfig();
-    const out = await gspPost(cfg, '/ewaybill/generate', { gstin: cfg.gstin, invoice, distanceKm });
+    const out = await gspPost(cfg, '/ewaybill/generate', { gstin: cfg.gstin, invoice, distanceKm, transportMode, vehicleNo, transporterId });
     return {
       ewbNo: String(pick(out, 'ewbNo', 'EwbNo', 'ewayBillNo') ?? ''),
       ewbDate: pick(out, 'ewbDate', 'EwbDt') || new Date().toISOString(),
       validUntil: pick(out, 'validUntil', 'validUpto', 'ValidUpto'),
       provider: cfg.provider || 'gsp',
     };
+  },
+
+  /** Part-B update (vehicle change in transit). */
+  async updatePartB({ ewbNo, vehicleNo, transportMode, reason }) {
+    const cfg = await loadGstConfig();
+    await gspPost(cfg, '/ewaybill/update-partb', { gstin: cfg.gstin, ewbNo, vehicleNo, transportMode, reason });
+    return { updated: true, provider: cfg.provider || 'gsp' };
   },
 
   async cancelEWB({ invoiceId, reason }) {

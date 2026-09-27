@@ -476,11 +476,14 @@ export function distributorAppResolvers(app) {
             if (p) { name = name || p.name; pack = p.packing_size ?? null; if (l.gstPercent == null) gst = num(p.gst_percent) ?? 0; }
           }
           if (!name) throw httpError('Each item needs a product', 400);
-          const lineTotal = round2(l.quantity * l.unitPrice);
+          // quantity / unit_price are NUMERIC(…,2): compute on the values that get stored.
+          const quantity = round2(l.quantity), unitPrice = round2(l.unitPrice);
+          if (!(quantity > 0)) throw httpError('Each item needs a quantity greater than 0', 400);
+          if (!(unitPrice >= 0)) throw httpError('Price cannot be negative', 400);
+          const lineTotal = round2(quantity * unitPrice);
           subTotal += lineTotal;
           if (billType === 'GST') taxTotal += round2(lineTotal * gst / 100);
-          if (!(l.unitPrice >= 0)) throw httpError('Price cannot be negative', 400);
-          prepared.push({ productId: l.productId ?? null, name, pack, quantity: l.quantity, unitPrice: l.unitPrice, gst: billType === 'GST' ? gst : 0, lineTotal });
+          prepared.push({ productId: l.productId ?? null, name, pack, quantity, unitPrice, gst: billType === 'GST' ? gst : 0, lineTotal });
         }
         subTotal = round2(subTotal); taxTotal = round2(taxTotal);
         const total = round2(subTotal + taxTotal);
@@ -500,7 +503,7 @@ export function distributorAppResolvers(app) {
               [sale.id, p.productId, p.name, p.pack, p.quantity, p.unitPrice, p.gst, p.lineTotal],
             );
           }
-          await logActivity(null, 'DIST_CREATE_SALE', 'distributor_sale', sale.id, { billNo, via: 'distributor-app' });
+          void logActivity(null, 'DIST_CREATE_SALE', 'distributor_sale', sale.id, { billNo, via: 'distributor-app' });
           const code = farmerId ? (await client.query('SELECT farmer_code FROM farmers WHERE id=$1', [farmerId])).rows[0]?.farmer_code : null;
           return mapSale({ ...sale, farmer_code: code });
         });

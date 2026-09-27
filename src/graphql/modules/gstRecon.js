@@ -8,6 +8,7 @@ import { query, withTransaction } from '../../db/index.js';
 import { assertRole } from '../context.js';
 import { num, isoDate, logActivity } from '../helpers.js';
 import { normGstin as normG, normDocNo, matchKey, classifyPair } from '../../services/gst/calc.js';
+import { buildGstr3b } from './gstReturns.js';
 
 export const gstReconTypeDefs = /* GraphQL */ `
   type GstReconImport { id: ID!, source: String!, period: String!, gstin: String, fileName: String, lineCount: Int!, createdAt: DateTime! }
@@ -354,11 +355,12 @@ export function gstReconResolvers() {
 
         for (const d of portalDocs) {
           const portalTax = round2(num(d.igst) + num(d.cgst) + num(d.sgst) + num(d.cess));
-          portalTaxTotal += portalTax;
+          const sg = d.doc_type === 'CN' ? -1 : 1; // supplier credit notes reduce ITC
+          portalTaxTotal += sg * portalTax;
           const b = (d.matched_purchase_id && bookById.get(d.matched_purchase_id)) || bookByKey.get(`${normGstin(d.ctin)}|${normNo(d.doc_no)}`);
           const status = d.match_status || 'PORTAL_ONLY';
           counts[status] = (counts[status] || 0) + 1;
-          if (status === 'MATCHED') matchedTaxTotal += portalTax;
+          if (status === 'MATCHED') matchedTaxTotal += sg * portalTax;
           rows.push({
             id: d.id, status, source, ctin: d.ctin, supplierName: d.trade_name || (b ? b.vname : null),
             docType: d.doc_type, docNo: d.doc_no, docDate: isoDate(d.doc_date),
@@ -409,7 +411,7 @@ export function gstReconResolvers() {
         const rows = docs.map((d) => {
           const tax = round2(num(d.igst) + num(d.cgst) + num(d.sgst) + num(d.cess));
           const action = d.ims_action || 'NO_ACTION';
-          if (action === 'ACCEPTED') { s.accepted += 1; s.acceptedTax += tax; }
+          if (action === 'ACCEPTED') { s.accepted += 1; s.acceptedTax += d.doc_type === 'CN' ? -tax : tax; }
           else if (action === 'REJECTED') s.rejected += 1;
           else if (action === 'PENDING') s.pending += 1;
           else s.noAction += 1;
@@ -433,31 +435,15 @@ export function gstReconResolvers() {
 
       challanReconciliation: async (_p, { period }, ctx) => {
         guard(ctx);
-        const { from, to } = periodRange(period);
-        // Liability = net output tax for the period (output − ITC from 2B/books), per head.
-        const out = (await query(
-          `SELECT COALESCE(SUM(igst),0) igst, COALESCE(SUM(cgst),0) cgst, COALESCE(SUM(sgst),0) sgst
-           FROM invoices WHERE bill_type='GST' AND status<>'CANCELLED' AND invoice_date>=$1 AND invoice_date<=$2`,
-          [from, to],
-        )).rows[0];
-        const imp2b = (await query("SELECT id FROM gst_recon_imports WHERE source='GSTR2B' AND period=$1 ORDER BY created_at DESC LIMIT 1", [period])).rows[0];
-        let itc = { igst: 0, cgst: 0, sgst: 0 };
-        if (imp2b) {
-          const s = (await query(
-            `SELECT COALESCE(SUM(igst),0) igst, COALESCE(SUM(cgst),0) cgst, COALESCE(SUM(sgst),0) sgst FROM gst_recon_docs
-             WHERE import_id=$1 AND COALESCE(itc_eligible,true) AND COALESCE(ims_action,'')<>'REJECTED'`,
-            [imp2b.id],
-          )).rows[0];
-          itc = { igst: num(s.igst), cgst: num(s.cgst), sgst: num(s.sgst) };
-        }
-        const paid = (await query(
-          `SELECT COALESCE(SUM(igst),0) igst, COALESCE(SUM(cgst),0) cgst, COALESCE(SUM(sgst),0) sgst FROM gst_challans WHERE period=$1`,
-          [period],
-        )).rows[0];
+        periodRange(period);
+        // Liability = GSTR-3B cash payable (net of credit notes + RCM, after s.49 ITC set-off),
+        // so the challan view always agrees with the 3B the user files.
+        const r3b = await buildGstr3b(period);
+        const pay = r3b.taxPayable, paid = r3b.challanPaid;
         const heads = [
-          ['IGST', Math.max(0, num(out.igst) - itc.igst), num(paid.igst)],
-          ['CGST', Math.max(0, num(out.cgst) - itc.cgst), num(paid.cgst)],
-          ['SGST/UTGST', Math.max(0, num(out.sgst) - itc.sgst), num(paid.sgst)],
+          ['IGST', pay.igst, paid.igst],
+          ['CGST', pay.cgst, paid.cgst],
+          ['SGST/UTGST', pay.sgst, paid.sgst],
         ];
         const rows = heads.map(([head, liability, p]) => ({ head, liability: round2(liability), paid: round2(p), balance: round2(liability - p) }));
         return {
@@ -472,12 +458,15 @@ export function gstReconResolvers() {
     Mutation: {
       importGstPortalJson: async (_p, { source, period, fileName, json }, ctx) => {
         const actor = guardWrite(ctx);
-        const src = source.toUpperCase();
+        const src = String(source || '').toUpperCase();
+        if (!['GSTR2A', 'GSTR2B', 'GSTR1', 'CHALLAN'].includes(src)) throw Object.assign(new Error('Source must be GSTR2A, GSTR2B, GSTR1 or CHALLAN'), { statusCode: 400 });
+        periodRange(period);
+        if (!json || typeof json !== 'object') throw Object.assign(new Error('The file is not a GST portal JSON'), { statusCode: 400 });
         const gstin = json?.gstin || json?.data?.gstin || null;
 
         if (src === 'CHALLAN') {
           const challans = parseChallans(json, period);
-          return withTransaction(async (client) => {
+          const imp = await withTransaction(async (client) => {
             const imp = (await client.query(
               `INSERT INTO gst_recon_imports (source, period, gstin, file_name, raw, line_count, uploaded_by)
                VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
@@ -490,13 +479,17 @@ export function gstReconResolvers() {
                 [c.cpin, c.challanNo, c.period, c.paidDate, c.igst, c.cgst, c.sgst, c.cess, c.fees, c.interest, c.amount, c.mode, imp.id, actor.sub],
               );
             }
-            await logActivity(actor.sub, 'IMPORT_GST_CHALLAN', 'gst_recon_import', imp.id, { period, count: challans.length });
-            return mapImport(imp);
+            return imp;
           });
+          // Audit write outside the transaction (it uses the pool, not the tx client).
+          await logActivity(actor.sub, 'IMPORT_GST_CHALLAN', 'gst_recon_import', imp.id, { period, count: challans.length });
+          return mapImport(imp);
         }
 
         const docs = parsePortalJson(src, json);
-        return withTransaction(async (client) => {
+        const root = json?.data?.docdata || json?.data || json;
+        if (!docs.length && !('b2b' in root || 'cdnr' in root)) throw Object.assign(new Error(`No B2B invoices or credit/debit notes found — is this the ${src} JSON downloaded from gst.gov.in?`), { statusCode: 400 });
+        const imp = await withTransaction(async (client) => {
           const imp = (await client.query(
             `INSERT INTO gst_recon_imports (source, period, gstin, file_name, raw, line_count, uploaded_by)
              VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
@@ -510,9 +503,10 @@ export function gstReconResolvers() {
             );
           }
           await matchImport(client, imp.id, src, period);
-          await logActivity(actor.sub, 'IMPORT_GST_PORTAL', 'gst_recon_import', imp.id, { source: src, period, count: docs.length });
-          return mapImport(imp);
+          return imp;
         });
+        await logActivity(actor.sub, 'IMPORT_GST_PORTAL', 'gst_recon_import', imp.id, { source: src, period, count: docs.length });
+        return mapImport(imp);
       },
 
       deleteGstReconImport: async (_p, { id }, ctx) => {
@@ -551,11 +545,17 @@ export function gstReconResolvers() {
 
       recordGstChallan: async (_p, { input }, ctx) => {
         const actor = guardWrite(ctx);
+        periodRange(input.period);
+        if (input.paidDate && !/^\d{4}-\d{2}-\d{2}$/.test(input.paidDate)) throw Object.assign(new Error('Paid date must be YYYY-MM-DD'), { statusCode: 400 });
+        for (const k of ['igst', 'cgst', 'sgst', 'cess', 'fees', 'interest']) {
+          if (num(input[k]) < 0) throw Object.assign(new Error(`${k.toUpperCase()} cannot be negative`), { statusCode: 400 });
+        }
         const amount = round2((num(input.igst) || 0) + (num(input.cgst) || 0) + (num(input.sgst) || 0) + (num(input.cess) || 0) + (num(input.fees) || 0) + (num(input.interest) || 0));
+        if (!(amount > 0)) throw Object.assign(new Error('Enter at least one amount paid'), { statusCode: 400 });
         const { rows } = await query(
           `INSERT INTO gst_challans (cpin, challan_no, period, paid_date, igst, cgst, sgst, cess, fees, interest, amount, mode, created_by)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
-          [input.cpin ?? null, input.challanNo ?? null, input.period, input.paidDate ?? null, num(input.igst) || 0, num(input.cgst) || 0, num(input.sgst) || 0, num(input.cess) || 0, num(input.fees) || 0, num(input.interest) || 0, amount, input.mode ?? null, actor.sub],
+          [input.cpin || null, input.challanNo || null, input.period, input.paidDate || null, num(input.igst) || 0, num(input.cgst) || 0, num(input.sgst) || 0, num(input.cess) || 0, num(input.fees) || 0, num(input.interest) || 0, amount, input.mode || null, actor.sub],
         );
         await logActivity(actor.sub, 'RECORD_GST_CHALLAN', 'gst_challan', rows[0].id, { period: input.period, amount });
         return mapChallan(rows[0]);

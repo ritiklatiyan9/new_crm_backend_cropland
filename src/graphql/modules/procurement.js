@@ -4,11 +4,16 @@
 import { query, withTransaction } from '../../db/index.js';
 import { assertAuth, assertRole } from '../context.js';
 import { httpError, logActivity, num, isoDate } from '../helpers.js';
+import { vendorProfile } from '../../services/vendorProfile.js';
+import { purchaseDocument, purchaseLine } from '../../services/purchaseDocument.js';
 import { splitTax, roundGst } from '../../services/gst/calc.js';
 import { resolveStateCode, stateName } from '../../services/gst/stateCodes.js';
 
 export const procurementTypeDefs = /* GraphQL */ `
   type Vendor {
+    pan: String
+    pincode: String
+    invoiceDefaults: JSON
     id: ID!
     name: String!
     contactPerson: String
@@ -29,6 +34,7 @@ export const procurementTypeDefs = /* GraphQL */ `
   }
 
   type POLine {
+    entryDetails: JSON
     id: ID!
     productId: ID!
     productName: String!
@@ -43,6 +49,8 @@ export const procurementTypeDefs = /* GraphQL */ `
   }
 
   type PurchaseOrder {
+    documentDetails: JSON
+    bill: PurchaseInvoice
     id: ID!
     poNo: String!
     vendorId: ID!
@@ -61,6 +69,7 @@ export const procurementTypeDefs = /* GraphQL */ `
   }
 
   type PurchaseInvoice {
+    printSnapshot: JSON
     id: ID!
     billNo: String!
     internalNo: String!
@@ -97,6 +106,9 @@ export const procurementTypeDefs = /* GraphQL */ `
   type PurchaseStats { vendors: Int!, openPos: Int!, purchasesMtd: Float!, vendorOutstanding: Float! }
 
   input VendorInput {
+    pan: String
+    pincode: String
+    invoiceDefaults: JSON
     name: String!
     contactPerson: String
     phone: String
@@ -111,8 +123,8 @@ export const procurementTypeDefs = /* GraphQL */ `
     msmeRegDate: String
     paymentTermsDays: Int
   }
-  input POLineInput { productId: ID!, quantity: Float!, unitCost: Float! }
-  input CreatePOInput { vendorId: ID!, orderDate: String, expectedDate: String, notes: String, lines: [POLineInput!]! }
+  input POLineInput { productId: ID!, quantity: Float!, unitCost: Float!, entryDetails: JSON }
+  input CreatePOInput { documentDetails: JSON, vendorId: ID!, orderDate: String, expectedDate: String, notes: String, lines: [POLineInput!]! }
   input ReceiveLineInput { poLineId: ID!, batchNumber: String!, manufacturingDate: String, expiryDate: String, quantity: Float! }
   input ReceivePOInput { poId: ID!, warehouseId: ID!, lines: [ReceiveLineInput!]! }
   input VendorPaymentInput { vendorId: ID!, purchaseInvoiceId: ID, amount: Float!, method: String, reference: String }
@@ -164,6 +176,7 @@ const PINV_SELECT = 'SELECT pi.*, v.name vendor_name FROM purchase_invoices pi J
 const mapVendor = (r) =>
   r && {
     id: r.id, name: r.name, contactPerson: r.contact_person, phone: r.phone, email: r.email,
+    pan: r.pan ?? r.gstin?.slice(2, 12) ?? null, pincode: r.pincode ?? null, invoiceDefaults: r.invoice_defaults ?? {},
     gstin: r.gstin, address: r.address, city: r.city, state: r.state,
     outstanding: num(r.outstanding) ?? 0,
     udyamNo: r.udyam_no, msmeType: r.msme_type, msmeRegistered: r.msme_registered ?? false,
@@ -176,10 +189,12 @@ const mapPO = (r) =>
     id: r.id, poNo: r.po_no, vendorId: r.vendor_id, vendorName: r.vendor_name ?? null,
     status: r.status, orderDate: isoDate(r.order_date), expectedDate: isoDate(r.expected_date),
     subTotal: num(r.sub_total), taxTotal: num(r.tax_total), totalAmount: num(r.total_amount),
+    documentDetails: r.document_details ?? {},
     notes: r.notes, createdAt: r.created_at, itemCount: r.item_count ?? 0, hasBill: Boolean(r.has_bill),
   };
 const mapPInv = (r) =>
   r && {
+    printSnapshot: r.print_snapshot ?? null,
     id: r.id, billNo: r.bill_no, internalNo: r.internal_no, poId: r.po_id, vendorId: r.vendor_id, vendorName: r.vendor_name ?? null,
     invoiceDate: isoDate(r.invoice_date), taxableValue: num(r.taxable_value) ?? 0,
     igst: num(r.igst) ?? 0, cgst: num(r.cgst) ?? 0, sgst: num(r.sgst) ?? 0,
@@ -188,13 +203,14 @@ const mapPInv = (r) =>
     balanceDue: round2(num(r.total_amount) - num(r.amount_paid)), createdAt: r.created_at,
   };
 function vVals(i) {
-  const name = str(i.name);
-  if (!name) throw httpError('Vendor name is required', 400);
+  let profile;
+  try { profile = vendorProfile(i); } catch (e) { throw httpError(e.message, 400); }
+  const { name } = profile;
   const days = i.paymentTermsDays ?? 45;
   if (!Number.isInteger(days) || days < 0) throw httpError('Payment terms must be whole days (0 or more)', 400);
   const msme = Boolean(i.msmeRegistered);
-  return [name, str(i.contactPerson), str(i.phone), str(i.email), str(i.gstin)?.toUpperCase() ?? null, str(i.address), str(i.city), str(i.state),
-    msme ? str(i.udyamNo)?.toUpperCase() ?? null : null, msme ? str(i.msmeType) ?? 'NA' : 'NA', msme, msme ? str(i.msmeRegDate) : null, days];
+  return [name, str(i.contactPerson), profile.phone, profile.email, profile.gstin, str(i.address), str(i.city), profile.state,
+    msme ? str(i.udyamNo)?.toUpperCase() ?? null : null, msme ? str(i.msmeType) ?? 'NA' : 'NA', msme, msme ? str(i.msmeRegDate) : null, days, profile.pan, profile.pincode, JSON.stringify(profile.invoiceDefaults)];
 }
 
 /**
@@ -208,7 +224,7 @@ async function billDraft(db, po) {
   const vendor = (await db.query('SELECT gstin, state FROM vendors WHERE id = $1', [po.vendor_id])).rows[0] || {};
   const coState = resolveStateCode({ gstin: company.gstin, stateName: company.state });
   const vState = resolveStateCode({ gstin: vendor.gstin, stateName: vendor.state });
-  const isInterstate = !!coState && !!vState && coState !== vState;
+  const isInterstate = po.document_details?.taxMode ? po.document_details.taxMode === 'INTERSTATE' : !!coState && !!vState && coState !== vState;
   const basis = lines.some((l) => num(l.received_qty) > 0) ? 'RECEIVED' : 'ORDERED';
   let taxableValue = 0, igst = 0, cgst = 0, sgst = 0;
   for (const l of lines) {
@@ -231,7 +247,7 @@ export function procurementResolvers() {
         assertAuth(ctx);
         const { rows } = await query(
           `SELECT * FROM vendors
-           WHERE ($1::text IS NULL OR name ILIKE '%'||$1||'%' OR gstin ILIKE '%'||$1||'%')
+           WHERE ($1::text IS NULL OR name ILIKE '%'||$1||'%' OR gstin ILIKE '%'||$1||'%' OR pan ILIKE '%'||$1||'%' OR phone ILIKE '%'||$1||'%' OR contact_person ILIKE '%'||$1||'%' OR city ILIKE '%'||$1||'%')
              AND ($2::bool IS NULL OR is_active = $2)
            ORDER BY created_at DESC LIMIT $3`,
           [str(search), activeOnly ?? null, Math.min(limit ?? 100, 1000)],
@@ -289,17 +305,20 @@ export function procurementResolvers() {
       createVendor: async (_p, { input }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
         const { rows } = await query(
-          `INSERT INTO vendors (name, contact_person, phone, email, gstin, address, city, state, udyam_no, msme_type, msme_registered, msme_reg_date, payment_terms_days)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`, vVals(input));
+          `INSERT INTO vendors (name, contact_person, phone, email, gstin, address, city, state, udyam_no, msme_type, msme_registered, msme_reg_date, payment_terms_days, pan, pincode, invoice_defaults)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`, vVals(input));
         await logActivity(a.sub, 'CREATE_VENDOR', 'vendor', rows[0].id);
         return mapVendor(rows[0]);
       },
       updateVendor: async (_p, { id, input }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
+        const existing = (await query('SELECT * FROM vendors WHERE id=$1', [id])).rows[0];
+        if (!existing) throw httpError('Vendor not found', 404);
+        const merged = { ...mapVendor(existing), ...input };
         const { rows } = await query(
           `UPDATE vendors SET name=$2, contact_person=$3, phone=$4, email=$5, gstin=$6, address=$7, city=$8, state=$9,
-             udyam_no=$10, msme_type=$11, msme_registered=$12, msme_reg_date=$13, payment_terms_days=$14, updated_at=now() WHERE id=$1 RETURNING *`,
-          [id, ...vVals(input)]);
+             udyam_no=$10, msme_type=$11, msme_registered=$12, msme_reg_date=$13, payment_terms_days=$14, pan=$15, pincode=$16, invoice_defaults=$17, updated_at=now() WHERE id=$1 RETURNING *`,
+          [id, ...vVals(merged)]);
         if (!rows[0]) throw httpError('Vendor not found', 404);
         await logActivity(a.sub, 'UPDATE_VENDOR', 'vendor', id);
         return mapVendor(rows[0]);
@@ -331,32 +350,50 @@ export function procurementResolvers() {
           if (!(l.unitCost >= 0)) throw httpError('Unit cost cannot be negative', 400);
         }
         return withTransaction(async (client) => {
-          const v = await client.query('SELECT id FROM vendors WHERE id=$1', [input.vendorId]);
+          const v = await client.query('SELECT * FROM vendors WHERE id=$1', [input.vendorId]);
           if (!v.rows[0]) throw httpError('Vendor not found', 404);
+          const company = (await client.query('SELECT * FROM company_settings WHERE id=1')).rows[0] || {};
+          const vendor = v.rows[0];
+          const vendorState = resolveStateCode({ gstin: vendor.gstin, stateName: vendor.state });
+          const buyerState = vendor.invoice_defaults?.placeOfSupply
+            ? resolveStateCode({ stateName: vendor.invoice_defaults.placeOfSupply })
+            : resolveStateCode({ gstin: company.gstin, stateName: company.state });
+          const address = [company.address_line1, company.address_line2, company.city, company.state, company.pincode].filter(Boolean).join(', ');
+          const documentDetails = purchaseDocument({
+            supplierName: vendor.name, supplierAddress: [vendor.address, vendor.city, vendor.state, vendor.pincode].filter(Boolean).join(', '),
+            supplierGstin: vendor.gstin, supplierPan: vendor.pan || vendor.gstin?.slice(2, 12), supplierPhone: vendor.phone, supplierEmail: vendor.email, supplierState: vendor.state,
+            billedName: company.legal_name, billedAddress: address, billedGstin: company.gstin,
+            shippedName: company.legal_name, shippedAddress: address, shippedGstin: company.gstin,
+            placeOfSupply: company.state, copyLabel: 'Original Copy',
+            taxMode: vendorState && buyerState && vendorState !== buyerState ? 'INTERSTATE' : 'INTRASTATE',
+            ...Object.fromEntries(Object.entries(vendor.invoice_defaults ?? {}).filter(([, value]) => value !== '')),
+            ...input.documentDetails,
+          });
           const prods = new Map((await client.query('SELECT * FROM products WHERE id = ANY($1::uuid[])', [input.lines.map((l) => l.productId)])).rows.map((p) => [p.id, p]));
           let subTotal = 0, taxTotal = 0;
           const lines = [];
           for (const l of input.lines) {
             const p = prods.get(l.productId);
             if (!p) throw httpError('Product not found', 404);
-            const lineTotal = round2(l.quantity * l.unitCost);
+            const priced = purchaseLine(l);
+            const lineTotal = priced.lineTotal;
             const gst = num(p.gst_percent ?? 0);
             subTotal += lineTotal; taxTotal += roundGst(lineTotal * gst / 100);
-            lines.push({ p, l, lineTotal, gst });
+            lines.push({ p, l: { ...l, ...priced }, lineTotal, gst });
           }
           subTotal = round2(subTotal); taxTotal = round2(taxTotal);
-          const total = round2(subTotal + taxTotal);
+          const total = round2(subTotal + (documentDetails.reverseCharge ? 0 : taxTotal));
           const orderDate = str(input.orderDate);
           const poNo = `PO-${fy(orderDate)}-${String((await client.query("SELECT nextval('po_seq') n")).rows[0].n).padStart(5, '0')}`;
           const po = await client.query(
-            `INSERT INTO purchase_orders (po_no, vendor_id, status, order_date, expected_date, sub_total, tax_total, total_amount, notes, created_by)
-             VALUES ($1,$2,'DRAFT',COALESCE($3::date,CURRENT_DATE),$4,$5,$6,$7,$8,$9) RETURNING *`,
-            [poNo, input.vendorId, orderDate, str(input.expectedDate), subTotal, taxTotal, total, str(input.notes), a.sub]);
+            `INSERT INTO purchase_orders (po_no, vendor_id, status, order_date, expected_date, sub_total, tax_total, total_amount, notes, created_by, document_details)
+             VALUES ($1,$2,'DRAFT',COALESCE($3::date,CURRENT_DATE),$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+            [poNo, input.vendorId, orderDate, str(input.expectedDate), subTotal, taxTotal, total, str(input.notes), a.sub, JSON.stringify(documentDetails)]);
           for (const { p, l, lineTotal, gst } of lines) {
             await client.query(
-              `INSERT INTO purchase_order_lines (po_id, product_id, product_name, hsn_code, uom, packing_size, quantity, unit_cost, gst_percent, line_total)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-              [po.rows[0].id, p.id, p.name, p.hsn_code, p.uom, p.packing_size ?? null, l.quantity, l.unitCost, gst, lineTotal]);
+              `INSERT INTO purchase_order_lines (po_id, product_id, product_name, hsn_code, uom, packing_size, quantity, unit_cost, gst_percent, line_total, entry_details)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+              [po.rows[0].id, p.id, p.name, l.entryDetails.hsnCode || p.hsn_code, p.uom, p.packing_size ?? null, l.quantity, l.unitCost, gst, lineTotal, JSON.stringify(l.entryDetails)]);
           }
           await logActivity(a.sub, 'CREATE_PO', 'purchase_order', po.rows[0].id, { poNo });
           const full = await client.query(`${PO_SELECT} WHERE po.id=$1`, [po.rows[0].id]);
@@ -463,10 +500,18 @@ export function procurementResolvers() {
           const total = roundGst(taxable + (isRcm ? 0 : tax));
           const elig = ['ELIGIBLE', 'INELIGIBLE', 'PARTIAL'].includes(String(itcEligibility || '').toUpperCase()) ? itcEligibility.toUpperCase() : 'ELIGIBLE';
 
+          const printedLines = (await client.query('SELECT * FROM purchase_order_lines WHERE po_id=$1 ORDER BY product_name', [poId])).rows
+            .map((line) => {
+              const quantity = d.basis === 'RECEIVED' ? num(line.received_qty) : num(line.quantity);
+              return { id: line.id, productId: line.product_id, productName: line.product_name, hsnCode: line.hsn_code,
+                uom: line.uom, packingSize: line.packing_size, quantity, unitCost: num(line.unit_cost),
+                gstPercent: num(line.gst_percent), lineTotal: roundGst(quantity * num(line.unit_cost)), entryDetails: line.entry_details ?? {} };
+            }).filter((line) => line.quantity > 0);
+          const printSnapshot = { documentDetails: { ...po.document_details, invoiceNo: bill, invoiceDate: date, reverseCharge: !!isRcm, taxMode: interstate ? 'INTERSTATE' : 'INTRASTATE' }, lines: printedLines };
           const inv = await client.query(
-            `INSERT INTO purchase_invoices (bill_no, internal_no, po_id, vendor_id, invoice_date, taxable_value, tax_value, igst, cgst, sgst, is_interstate, is_rcm, itc_eligibility, total_amount, created_by)
-             VALUES ($1,$2,$3,$4,COALESCE($5::date,CURRENT_DATE),$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
-            [bill, internalNo, poId, po.vendor_id, date, taxable, tax, heads.igst, heads.cgst, heads.sgst, interstate, !!isRcm, elig, total, a.sub]);
+            `INSERT INTO purchase_invoices (bill_no, internal_no, po_id, vendor_id, invoice_date, taxable_value, tax_value, igst, cgst, sgst, is_interstate, is_rcm, itc_eligibility, total_amount, created_by, print_snapshot)
+             VALUES ($1,$2,$3,$4,COALESCE($5::date,CURRENT_DATE),$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+            [bill, internalNo, poId, po.vendor_id, date, taxable, tax, heads.igst, heads.cgst, heads.sgst, interstate, !!isRcm, elig, total, a.sub, JSON.stringify(printSnapshot)]);
           await client.query('UPDATE vendors SET outstanding = outstanding + $2 WHERE id=$1', [po.vendor_id, total]);
           await logActivity(a.sub, 'RECORD_PURCHASE_BILL', 'purchase_invoice', inv.rows[0].id, { billNo: bill });
           const full = await client.query(`${PINV_SELECT} WHERE pi.id=$1`, [inv.rows[0].id]);
@@ -509,11 +554,16 @@ export function procurementResolvers() {
     },
 
     PurchaseOrder: {
+      bill: async (parent) => {
+        const { rows } = await query(`${PINV_SELECT} WHERE pi.po_id=$1 ORDER BY pi.created_at DESC LIMIT 1`, [parent.id]);
+        return mapPInv(rows[0]);
+      },
       lines: async (parent) => {
         const { rows } = await query('SELECT * FROM purchase_order_lines WHERE po_id=$1 ORDER BY product_name', [parent.id]);
         return rows.map((r) => ({
           id: r.id, productId: r.product_id, productName: r.product_name, hsnCode: r.hsn_code, uom: r.uom, packingSize: r.packing_size ?? null,
           quantity: num(r.quantity), receivedQty: num(r.received_qty), unitCost: num(r.unit_cost),
+          entryDetails: r.entry_details ?? {},
           gstPercent: num(r.gst_percent), lineTotal: num(r.line_total),
         }));
       },

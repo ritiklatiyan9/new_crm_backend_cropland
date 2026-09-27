@@ -5,7 +5,7 @@
 import { validateGstin } from './stateCodes.js';
 
 // GST rates allowed on the portal (incl. cess-relevant + special rates).
-const VALID_RATES = new Set([0, 0.1, 0.25, 1, 1.5, 3, 5, 6, 7.5, 12, 18, 28]);
+const VALID_RATES = new Set([0, 0.1, 0.25, 1, 1.5, 3, 5, 6, 7.5, 12, 18, 28, 40]); // 40% = GST 2.0 demerit slab
 const DMY_RE = /^\d{2}-\d{2}-\d{4}$/;
 const r2 = (v) => Math.round((Number(v || 0) + Number.EPSILON) * 100) / 100;
 const num = (v) => Number(v || 0);
@@ -23,6 +23,15 @@ function checkItem(itm, ctx, errors, warnings) {
   if (num(d.iamt) > 0 && (num(d.camt) > 0 || num(d.samt) > 0)) errors.push(`${ctx}: both IGST and CGST/SGST present`);
 }
 
+/** Tax heads must follow the place of supply: POS = supplier state ⇒ CGST+SGST, else IGST. */
+function checkHeads(intra, itms, ctx, errors) {
+  for (const it of itms || []) {
+    const d = it.itm_det || it;
+    if (intra && num(d.iamt) > 0) errors.push(`${ctx}: IGST charged on an intra-state supply`);
+    if (!intra && (num(d.camt) > 0 || num(d.samt) > 0)) errors.push(`${ctx}: CGST/SGST charged on an inter-state supply`);
+  }
+}
+
 /** Validate a GSTR-1 portal payload. Returns { valid, errors, warnings }. */
 export function validateGstr1Payload(p = {}) {
   const errors = [];
@@ -32,6 +41,7 @@ export function validateGstr1Payload(p = {}) {
   if (!p.version) warnings.push('version missing (expected e.g. GST3.0.4)');
   if (p.gt == null) warnings.push('gt (aggregate turnover of preceding FY) not set');
   if (p.cur_gt == null) warnings.push('cur_gt (turnover April → period) not set');
+  const home = String(p.gstin || '').slice(0, 2);
 
   for (const party of p.b2b || []) {
     if (!validateGstin(party.ctin).valid) errors.push(`B2B: invalid recipient GSTIN ${party.ctin}`);
@@ -42,6 +52,7 @@ export function validateGstr1Payload(p = {}) {
       if (!String(inv.pos || '').match(/^\d{2}$/)) errors.push(`B2B ${inv.inum}: pos must be a 2-digit state code`);
       if (!['Y', 'N'].includes(inv.rchrg)) warnings.push(`B2B ${inv.inum}: rchrg should be Y/N`);
       for (const it of inv.itms || []) checkItem(it, `B2B ${inv.inum}`, errors, warnings);
+      checkHeads(inv.pos === home, inv.itms, `B2B ${inv.inum}`, errors);
     }
   }
   for (const party of p.b2cl || []) {
@@ -56,6 +67,7 @@ export function validateGstr1Payload(p = {}) {
     if (!['INTER', 'INTRA'].includes(row.sply_ty)) errors.push('B2CS: sply_ty must be INTER/INTRA');
     if (!String(row.pos || '').match(/^\d{2}$/)) errors.push('B2CS: pos must be a 2-digit state code');
     checkItem(row, `B2CS ${row.pos}@${row.rt}`, errors, warnings);
+    checkHeads(row.sply_ty === 'INTRA', [row], `B2CS ${row.pos}@${row.rt}`, errors);
   }
   for (const party of p.cdnr || []) {
     if (!validateGstin(party.ctin).valid) errors.push(`CDNR: invalid GSTIN ${party.ctin}`);
@@ -63,6 +75,7 @@ export function validateGstr1Payload(p = {}) {
       if (!['C', 'D'].includes(nt.ntty)) errors.push(`CDNR ${nt.nt_num}: ntty must be C/D`);
       if (!DMY_RE.test(nt.nt_dt || '')) errors.push(`CDNR ${nt.nt_num}: nt_dt must be dd-mm-yyyy`);
       for (const it of nt.itms || []) checkItem(it, `CDNR ${nt.nt_num}`, errors, warnings);
+      if (nt.pos) checkHeads(nt.pos === home, nt.itms, `CDNR ${nt.nt_num}`, errors);
     }
   }
   // Table 12: split B2B / B2C (current), or the legacy single `data` list.

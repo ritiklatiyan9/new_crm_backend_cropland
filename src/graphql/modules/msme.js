@@ -126,18 +126,22 @@ export function msmeResolvers() {
       msmeParties: async (_p, { registeredOnly, search }, ctx) => {
         guard(ctx);
         const reg = registeredOnly ? 'AND msme_registered = TRUE' : '';
-        const { rows: vendors } = await query(
-          `SELECT id, name, gstin, udyam_no, msme_type, msme_registered, msme_reg_date, payment_terms_days, outstanding
-           FROM vendors WHERE ($1::text IS NULL OR name ILIKE '%'||$1||'%' OR udyam_no ILIKE '%'||$1||'%') ${reg}
-           ORDER BY msme_registered DESC, name`,
-          [search ?? null],
-        );
-        const { rows: dists } = await query(
-          `SELECT id, name, gstin, udyam_no, msme_type, msme_registered, msme_reg_date, outstanding
-           FROM distributors WHERE ($1::text IS NULL OR name ILIKE '%'||$1||'%' OR udyam_no ILIKE '%'||$1||'%') ${reg}
-           ORDER BY msme_registered DESC, name`,
-          [search ?? null],
-        );
+        const q = String(search || '').trim() || null;
+        // ponytail: capped at 500 per party type; add pagination if a tenant outgrows it.
+        const [{ rows: vendors }, { rows: dists }] = await Promise.all([
+          query(
+            `SELECT id, name, gstin, udyam_no, msme_type, msme_registered, msme_reg_date, payment_terms_days, outstanding
+             FROM vendors WHERE ($1::text IS NULL OR name ILIKE '%'||$1||'%' OR udyam_no ILIKE '%'||$1||'%' OR gstin ILIKE '%'||$1||'%') ${reg}
+             ORDER BY msme_registered DESC, name LIMIT 500`,
+            [q],
+          ),
+          query(
+            `SELECT id, name, gstin, udyam_no, msme_type, msme_registered, msme_reg_date, outstanding
+             FROM distributors WHERE ($1::text IS NULL OR name ILIKE '%'||$1||'%' OR udyam_no ILIKE '%'||$1||'%' OR gstin ILIKE '%'||$1||'%') ${reg}
+             ORDER BY msme_registered DESC, name LIMIT 500`,
+            [q],
+          ),
+        ]);
         return [
           ...vendors.map((r) => ({
             partyType: 'VENDOR', id: r.id, name: r.name, gstin: r.gstin, udyamNo: r.udyam_no, msmeType: r.msme_type,
@@ -154,21 +158,20 @@ export function msmeResolvers() {
 
       msmeSummary: async (_p, _a, ctx) => {
         guard(ctx);
-        const s = (await query(
+        const [{ rows: [s] }, { rows: [od] }] = await Promise.all([query(
           `SELECT COUNT(*) FILTER (WHERE msme_registered)::int registered,
                   COUNT(*) FILTER (WHERE msme_type='MICRO')::int micro,
                   COUNT(*) FILTER (WHERE msme_type='SMALL')::int small,
                   COUNT(*) FILTER (WHERE msme_type='MEDIUM')::int medium
            FROM vendors`,
-        )).rows[0];
-        const od = (await query(
+        ), query(
           `SELECT COUNT(*)::int entries, COALESCE(SUM(pi.total_amount - pi.amount_paid),0) amt
            FROM purchase_invoices pi JOIN vendors v ON v.id=pi.vendor_id
            WHERE v.msme_registered AND v.msme_type IN ('MICRO','SMALL')
              AND (pi.total_amount - pi.amount_paid) > 0
              AND (pi.invoice_date + (LEAST(COALESCE(v.payment_terms_days,45), $1) || ' days')::interval)::date < CURRENT_DATE`,
           [MSMED_CAP_DAYS],
-        )).rows[0];
+        )]);
         return {
           registeredSuppliers: s.registered, micro: s.micro, small: s.small, medium: s.medium,
           overdueEntries: od.entries, overdueAmount: round2(num(od.amt)),
@@ -183,12 +186,21 @@ export function msmeResolvers() {
         if (input.msmeType && !['MICRO', 'SMALL', 'MEDIUM', 'NA'].includes(input.msmeType.toUpperCase())) {
           throw httpError('msmeType must be MICRO, SMALL, MEDIUM or NA', 400);
         }
-        const mt = input.msmeType ? input.msmeType.toUpperCase() : null;
+        const reg = !!input.msmeRegistered;
+        const udyam = String(input.udyamNo || '').trim().toUpperCase() || null;
+        if (reg && !udyam) throw httpError('Udyam number is required for a registered MSME', 400);
+        if (udyam && !/^UDYAM-[A-Z]{2}-\d{2}-\d{7}$/.test(udyam)) throw httpError('Udyam number must look like UDYAM-XX-00-0000000', 400);
+        const regDate = input.msmeRegDate || null;
+        if (regDate && !/^\d{4}-\d{2}-\d{2}$/.test(regDate)) throw httpError('Registration date must be YYYY-MM-DD', 400);
+        const terms = input.paymentTermsDays ?? null;
+        if (terms != null && (terms < 0 || terms > 365)) throw httpError('Agreed credit days must be between 0 and 365', 400);
+        // Not registered ⇒ not an MSME for Form-1, whatever type was left selected.
+        const mt = reg && input.msmeType ? input.msmeType.toUpperCase() : 'NA';
         if (type === 'VENDOR') {
           const { rows } = await query(
             `UPDATE vendors SET udyam_no=$2, msme_type=$3, msme_registered=$4, msme_reg_date=$5, payment_terms_days=COALESCE($6, payment_terms_days), updated_at=now()
              WHERE id=$1 RETURNING id, name, gstin, udyam_no, msme_type, msme_registered, msme_reg_date, payment_terms_days, outstanding`,
-            [id, input.udyamNo ?? null, mt, input.msmeRegistered, input.msmeRegDate ?? null, input.paymentTermsDays ?? null],
+            [id, udyam, mt, reg, regDate, terms],
           );
           if (!rows[0]) throw httpError('Vendor not found', 404);
           await logActivity(actor.sub, 'UPDATE_MSME', 'vendor', id, { msmeType: mt });
@@ -199,7 +211,7 @@ export function msmeResolvers() {
           const { rows } = await query(
             `UPDATE distributors SET udyam_no=$2, msme_type=$3, msme_registered=$4, msme_reg_date=$5, updated_at=now()
              WHERE id=$1 RETURNING id, name, gstin, udyam_no, msme_type, msme_registered, msme_reg_date, outstanding`,
-            [id, input.udyamNo ?? null, mt, input.msmeRegistered, input.msmeRegDate ?? null],
+            [id, udyam, mt, reg, regDate],
           );
           if (!rows[0]) throw httpError('Distributor not found', 404);
           await logActivity(actor.sub, 'UPDATE_MSME', 'distributor', id, { msmeType: mt });

@@ -401,7 +401,7 @@ const mapInvoice = (r) =>
     igst: num(r.igst),
     totalAmount: num(r.total_amount),
     amountPaid: num(r.amount_paid),
-    balanceDue: num(r.total_amount) - num(r.amount_paid),
+    balanceDue: round2(num(r.total_amount) - num(r.amount_paid)),
     irn: r.irn,
     ewayBillNo: r.eway_bill_no,
     status: r.status,
@@ -422,18 +422,20 @@ async function priceOrder(client, inputLines, customerType, billType, discountAm
   const lines = inputLines.map((l) => {
     const p = byId.get(l.productId);
     if (!p) throw httpError('Product not found', 404);
-    if (!(num(l.quantity) > 0)) throw httpError(`Quantity for ${p.name} must be greater than 0`, 400);
+    // order_lines.quantity is NUMERIC(14,2): price exactly what gets stored (0.125 → 0.13).
+    const qty = round2(num(l.quantity));
+    if (!(qty > 0)) throw httpError(`Quantity for ${p.name} must be greater than 0`, 400);
     const defaultPrice = customerType === 'FARMER'
       ? num(p.mrp ?? p.dealer_price ?? p.distributor_price ?? 0)
       : num(p.distributor_price ?? p.dealer_price ?? p.mrp ?? 0);
-    const unitPrice = l.unitPrice ?? defaultPrice;
+    const unitPrice = round2(num(l.unitPrice ?? defaultPrice)); // unit_price is NUMERIC(12,2)
     if (!(unitPrice >= 0)) throw httpError(`Price for ${p.name} cannot be negative`, 400);
     const disc = l.discountPct ?? 0;
     if (disc < 0 || disc > 100) throw httpError(`Discount for ${p.name} must be between 0 and 100%`, 400);
-    const lineTotal = round2(l.quantity * unitPrice * (1 - disc / 100));
+    const lineTotal = round2(qty * unitPrice * (1 - disc / 100));
     const gst = billType === 'GST' ? num(p.gst_percent ?? 0) : 0;
     subTotal += lineTotal;
-    return { p, l, unitPrice, disc, lineTotal, gst };
+    return { p, qty, unitPrice, disc, lineTotal, gst };
   });
   subTotal = round2(subTotal);
   const discountTotal = round2(Math.min(Math.max(num(discountAmount) || 0, 0), subTotal));
@@ -455,11 +457,11 @@ async function reverseLoyalty(client, orderId) {
 }
 
 async function insertOrderLines(client, orderId, lines) {
-  for (const { p, l, unitPrice, disc, lineTotal, gst } of lines) {
+  for (const { p, qty, unitPrice, disc, lineTotal, gst } of lines) {
     await client.query(
       `INSERT INTO order_lines (order_id, product_id, product_name, hsn_code, uom, packing_size, quantity, unit_price, discount_pct, gst_percent, line_total)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-      [orderId, p.id, p.name, p.hsn_code, p.uom, p.packing_size ?? null, l.quantity, unitPrice, disc, gst, lineTotal],
+      [orderId, p.id, p.name, p.hsn_code, p.uom, p.packing_size ?? null, qty, unitPrice, disc, gst, lineTotal],
     );
   }
 }
@@ -722,7 +724,8 @@ export function orderResolvers() {
              COALESCE(SUM(o.total_amount) FILTER (WHERE COALESCE(o.customer_type, 'DISTRIBUTOR') = 'DISTRIBUTOR'), 0) AS distributor_sales,
              COALESCE(SUM(o.total_amount) FILTER (WHERE o.customer_type = 'FARMER'), 0) AS farmer_sales,
              COALESCE(SUM(COALESCE(i.amount_paid, 0)), 0) AS collected,
-             COALESCE(SUM(o.total_amount - COALESCE(i.amount_paid, 0)), 0) AS outstanding
+             -- A receivable exists only once a bill is issued; placed/approved orders aren't dues yet.
+             COALESCE(SUM(i.total_amount - i.amount_paid) FILTER (WHERE i.id IS NOT NULL), 0) AS outstanding
            FROM orders o
            LEFT JOIN distributors d ON d.id = o.distributor_id
            LEFT JOIN farmers f ON f.id = o.farmer_id
@@ -750,7 +753,7 @@ export function orderResolvers() {
         if (!input.lines?.length) throw httpError('Order must have at least one line', 400);
         const billType = input.billType === 'NON_GST' ? 'NON_GST' : 'GST';
         const customerType = input.customerType === 'FARMER' ? 'FARMER' : 'DISTRIBUTOR';
-        const customerId = input.customerId ?? input.distributorId;
+        const customerId = input.customerId || input.distributorId; // "" from forms counts as unset
         if (!customerId) throw httpError('A customer (distributor or farmer) is required', 400);
         return withTransaction(async (client) => {
           const table = customerType === 'FARMER' ? 'farmers' : 'distributors';
@@ -820,7 +823,9 @@ export function orderResolvers() {
           }
 
           await insertOrderLines(client, orderId, lines);
-          await logActivity(actor.sub, 'CREATE_ORDER', 'order', orderId, { orderNo });
+          // Audit logs inside transactions are fire-and-forget (logActivity swallows errors):
+          // awaiting a second pool connection while holding row locks only adds latency.
+          void logActivity(actor.sub, 'CREATE_ORDER', 'order', orderId, { orderNo });
           return mapOrder(ord.rows[0]);
         });
       },
@@ -867,7 +872,7 @@ export function orderResolvers() {
              t.numPackages ?? null, t.totalWeight ?? null, t.freightCharges ?? null, t.freightType ?? null,
              t.dispatchThrough ?? null, t.deliveryNote ?? null, t.deliveryNoteDate ?? null, t.dispatchDocNo ?? null],
           );
-          await logActivity(actor.sub, 'UPDATE_ORDER_TRANSPORT', 'order', orderId);
+          void logActivity(actor.sub, 'UPDATE_ORDER_TRANSPORT', 'order', orderId);
           return mapOrder(rows[0]);
         });
       },
@@ -975,7 +980,7 @@ export function orderResolvers() {
           await client.query("UPDATE orders SET status='INVOICED', updated_at=now() WHERE id=$1", [orderId]);
           // Only distributors carry a running outstanding; farmer balances derive from their invoices/payments.
           if (!isFarmer && order.distributor_id) await client.query('UPDATE distributors SET outstanding = outstanding + $2 WHERE id = $1', [order.distributor_id, total]);
-          await logActivity(actor.sub, 'GENERATE_INVOICE', 'invoice', inv.rows[0].id, { invoiceNo, billType: type });
+          void logActivity(actor.sub, 'GENERATE_INVOICE', 'invoice', inv.rows[0].id, { invoiceNo, billType: type });
           return mapInvoice(inv.rows[0]);
         });
       },
@@ -999,7 +1004,7 @@ export function orderResolvers() {
              VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE(($8::date + time '12:00')::timestamptz, now())) RETURNING *`, // noon: the date never shifts across time zones
             [input.invoiceId, inv.rows[0].distributor_id, inv.rows[0].farmer_id, amount, blank(input.method), blank(input.reference), actor.sub, paidAt],
           );
-          await logActivity(actor.sub, 'RECORD_PAYMENT', 'payment', pay.rows[0].id);
+          void logActivity(actor.sub, 'RECORD_PAYMENT', 'payment', pay.rows[0].id);
           const r = pay.rows[0];
           return { id: r.id, amount: num(r.amount), method: r.method, reference: r.reference, paidAt: r.paid_at };
         });
@@ -1066,7 +1071,7 @@ export function orderResolvers() {
           // Replace the line items wholesale (order_lines cascade-delete with the order).
           await client.query('DELETE FROM order_lines WHERE order_id = $1', [id]);
           await insertOrderLines(client, id, lines);
-          await logActivity(actor.sub, 'UPDATE_ORDER', 'order', id, { orderNo: order.order_no });
+          void logActivity(actor.sub, 'UPDATE_ORDER', 'order', id, { orderNo: order.order_no });
           const updated = (await client.query('SELECT * FROM orders WHERE id = $1', [id])).rows[0];
           return mapOrder(updated);
         });
@@ -1087,6 +1092,10 @@ export function orderResolvers() {
           const inv = (await client.query('SELECT * FROM invoices WHERE order_id = $1 FOR UPDATE', [id])).rows[0];
           if (inv?.irn || inv?.eway_bill_no) {
             throw httpError('This invoice has an e-invoice (IRN) / E-Way Bill. Cancel it on the GST portal first — a registered invoice cannot be deleted.', 400);
+          }
+          // Deleting would silently erase money-received records; book a sales return / credit note instead.
+          if (inv && num(inv.amount_paid) > 0) {
+            throw httpError(`₹${num(inv.amount_paid).toFixed(2)} has been received against ${inv.invoice_no}. A paid bill cannot be deleted — record a sales return / credit note instead.`, 400);
           }
           if (inv) {
             // 1) Put dispatched stock back: reverse the FIFO OUT movements booked at
@@ -1121,7 +1130,7 @@ export function orderResolvers() {
           // 4) Delete the order — order_lines cascade; loyalty coins reversed; sales returns unlink.
           await reverseLoyalty(client, id);
           await client.query('DELETE FROM orders WHERE id = $1', [id]);
-          await logActivity(actor.sub, 'DELETE_ORDER', 'order', id, { orderNo: ord.order_no, hadInvoice: !!inv });
+          void logActivity(actor.sub, 'DELETE_ORDER', 'order', id, { orderNo: ord.order_no, hadInvoice: !!inv });
           return true;
         });
       },

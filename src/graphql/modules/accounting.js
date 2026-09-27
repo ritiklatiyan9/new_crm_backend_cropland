@@ -386,7 +386,12 @@ export function accountingResolvers() {
           [ledgerKey, to, from],
         );
         const counters = await ledgersByKey([...new Set(rows.map((r) => r.counter_key).filter(Boolean))]);
-        const opening = round2(rows.reduce((s, r) => (r.voucher_date < from ? s + n(r.amt) : s), n(ledger.opening_balance)));
+        // Income/expense ledgers close into P&L A/c at every FY end (same as trialBalance()):
+        // their opening is only this FY's postings before `from`.
+        const pl = ledger.nature === 'INCOME' || ledger.nature === 'EXPENSE';
+        const fyStart = `${fyOf(from).slice(0, 4)}-04-01`;
+        const opening = round2(rows.reduce((s, r) => (r.voucher_date < from && (!pl || r.voucher_date >= fyStart) ? s + n(r.amt) : s),
+          pl ? 0 : n(ledger.opening_balance)));
         let bal = opening;
         let totalDr = 0;
         let totalCr = 0;

@@ -82,3 +82,10 @@ test('GSTR-1: split HSN (B2B/B2C) — missing UQC is an error, bad HSN length a 
   assert.ok(r.warnings.some((w) => /4, 6 or 8 digits/.test(w)));
   assert.ok(!r.warnings.some((w) => /HSN B2B summary is empty/.test(w)));
 });
+
+test('GSTR-1: tax heads must follow the place of supply', () => {
+  const inter = { ...goodB2b, b2b: [{ ctin: goodB2b.b2b[0].ctin, inv: [{ ...goodB2b.b2b[0].inv[0], pos: '24', itms: [{ num: 1, itm_det: { rt: 18, txval: 1000, iamt: 0, camt: 90, samt: 90, csamt: 0 } }] }] }] };
+  assert.ok(validateGstr1Payload(inter).errors.some((e) => /CGST\/SGST charged on an inter-state/.test(e)));
+  const b2cs = { ...goodB2b, b2cs: [{ sply_ty: 'INTRA', pos: '27', typ: 'OE', rt: 18, txval: 100, iamt: 18, camt: 0, samt: 0, csamt: 0 }] };
+  assert.ok(validateGstr1Payload(b2cs).errors.some((e) => /IGST charged on an intra-state/.test(e)));
+});

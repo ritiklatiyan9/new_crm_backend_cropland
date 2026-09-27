@@ -465,12 +465,14 @@ export function partyResolvers() {
           for (const l of input.lines) {
             const p = byId.get(l.productId);
             if (!p) throw httpError('Product not found', 404);
-            if (!(l.quantity > 0)) throw httpError(`Quantity for ${p.name} must be greater than 0`, 400);
-            if (!(l.unitPrice >= 0)) throw httpError(`Price for ${p.name} cannot be negative`, 400);
-            const lineTotal = round2(l.quantity * l.unitPrice);
+            // quantity / unit_price are NUMERIC(…,2): compute on the values that get stored.
+            const quantity = round2(l.quantity), unitPrice = round2(l.unitPrice);
+            if (!(quantity > 0)) throw httpError(`Quantity for ${p.name} must be greater than 0`, 400);
+            if (!(unitPrice >= 0)) throw httpError(`Price for ${p.name} cannot be negative`, 400);
+            const lineTotal = round2(quantity * unitPrice);
             const gst = num(p.gst_percent ?? 0);
             subTotal += lineTotal; taxTotal += round2(lineTotal * gst / 100);
-            prepared.push({ l, name: p.name, pack: p.packing_size ?? null, gst, lineTotal });
+            prepared.push({ l: { ...l, quantity, unitPrice }, name: p.name, pack: p.packing_size ?? null, gst, lineTotal });
           }
           subTotal = round2(subTotal); taxTotal = round2(taxTotal);
           const total = round2(subTotal + taxTotal);
@@ -530,7 +532,7 @@ export function partyResolvers() {
               );
             }
           }
-          await logActivity(a.sub, 'CREATE_PARTY_SALE', 'party_sale', sale.id, { saleNo, party: input.partyType });
+          void logActivity(a.sub, 'CREATE_PARTY_SALE', 'party_sale', sale.id, { saleNo, party: input.partyType });
           return mapSale((await client.query(`${SALE_SELECT} WHERE s.id=$1`, [sale.id])).rows[0]);
         });
       },

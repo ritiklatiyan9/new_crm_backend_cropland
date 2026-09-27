@@ -1677,3 +1677,15 @@ CREATE INDEX IF NOT EXISTS idx_vpay_paid_at ON vendor_payments(paid_at);
 CREATE INDEX IF NOT EXISTS idx_psale_date ON party_sales(sale_date);
 CREATE INDEX IF NOT EXISTS idx_sret_status_date ON sales_returns(status, return_date);
 CREATE INDEX IF NOT EXISTS idx_pret_status_date ON purchase_returns(status, return_date);
+
+-- Purchase document snapshots and invoice-style printing.
+ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS document_details JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE purchase_order_lines ADD COLUMN IF NOT EXISTS entry_details JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE purchase_order_lines ALTER COLUMN unit_cost TYPE NUMERIC(16,6);
+ALTER TABLE purchase_order_lines ALTER COLUMN quantity TYPE NUMERIC(14,3), ALTER COLUMN received_qty TYPE NUMERIC(14,3);
+ALTER TABLE purchase_invoices ADD COLUMN IF NOT EXISTS print_snapshot JSONB;
+
+-- Supplier header and reusable purchase-invoice defaults.
+ALTER TABLE vendors ADD COLUMN IF NOT EXISTS pan TEXT;
+ALTER TABLE vendors ADD COLUMN IF NOT EXISTS pincode TEXT;
+ALTER TABLE vendors ADD COLUMN IF NOT EXISTS invoice_defaults JSONB NOT NULL DEFAULT '{}'::jsonb;
