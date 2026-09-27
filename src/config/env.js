@@ -89,12 +89,18 @@ export const env = {
     apiKey: optional('OPENWEATHER_API_KEY', ''),
   },
 
-  // AI Layer — Groq for generation, Gemini for embeddings only.
-  // Degrades to a deterministic mock when GROQ_API_KEY is unset.
+  // AI Layer — OpenRouter Gemini for multimodal generation. A direct Gemini key
+  // is retained only for vector embeddings because OpenRouter does not expose
+  // the Gemini embedding endpoint used by the training index.
   ai: {
-    groqApiKey: optional('GROQ_API_KEY', ''),
-    groqModel: optional('GROQ_MODEL', 'meta-llama/llama-4-scout-17b-16e-instruct'),
-    // Gemini is retained for embeddings only (Groq has no embedding model).
+    openRouterApiKey: optional('OPENROUTER_API_KEY', ''),
+    openRouterModel: optional('OPENROUTER_MODEL', 'google/gemini-3.1-flash-lite'),
+    openRouterSiteUrl: optional(
+      'OPENROUTER_SITE_URL',
+      'https://new-crm-backend-cropland-4n51.onrender.com',
+    ),
+    openRouterAppName: optional('OPENROUTER_APP_NAME', 'Cropland CRM'),
+    // Direct Gemini is used only for embeddings.
     // gemini-embedding-001 supports Matryoshka truncation; we request 768 dims to
     // match the Pinecone index dimension.
     geminiApiKey: optional('GEMINI_API_KEY', ''),

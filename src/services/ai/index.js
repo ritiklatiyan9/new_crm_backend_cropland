@@ -1,6 +1,6 @@
 // AI service — crop disease/pest diagnosis, photo captioning and advisory
-// generation. Provider: Groq when GROQ_API_KEY is set, otherwise Google Gemini
-// (GEMINI_API_KEY + GEMINI_MODEL). Gemini also provides the retrieval embeddings.
+// generation through OpenRouter's multimodal Gemini model. Direct Gemini is
+// retained only for retrieval embeddings.
 // Product recommendations are grounded in the company catalog (products table):
 // the model picks catalog codes, it never invents brand names.
 
@@ -8,19 +8,20 @@ import { env } from '../../config/env.js';
 import { query } from '../../db/index.js';
 import { getDownloadUrl, isAwsConfigured } from '../../utils/aws.js';
 
-const GROQ_KEY   = env.ai?.groqApiKey || process.env.GROQ_API_KEY || '';
-const GROQ_MODEL = env.ai?.groqModel  || process.env.GROQ_MODEL   || 'meta-llama/llama-4-scout-17b-16e-instruct';
-const GROQ_URL   = 'https://api.groq.com/openai/v1/chat/completions';
+const OPENROUTER_KEY = env.ai?.openRouterApiKey || process.env.OPENROUTER_API_KEY || '';
+const OPENROUTER_MODEL = env.ai?.openRouterModel || process.env.OPENROUTER_MODEL || 'google/gemini-3.1-flash-lite';
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const OPENROUTER_SITE = env.ai?.openRouterSiteUrl || process.env.OPENROUTER_SITE_URL || '';
+const OPENROUTER_APP = env.ai?.openRouterAppName || process.env.OPENROUTER_APP_NAME || 'Cropland CRM';
 
 const GEMINI_KEY   = env.ai?.geminiApiKey || process.env.GEMINI_API_KEY || '';
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
 const EMBED_MODEL  = env.ai?.embeddingModel || 'gemini-embedding-001';
 const EMBED_DIM    = env.ai?.embeddingDim   || 768;
 const GEMINI       = 'https://generativelanguage.googleapis.com/v1beta/models';
 
-const PROVIDER = GROQ_KEY ? 'groq' : GEMINI_KEY ? 'gemini' : null;
-const MODEL    = PROVIDER === 'groq' ? GROQ_MODEL : GEMINI_MODEL;
-export const aiConfigured = Boolean(PROVIDER);
+const PROVIDER = OPENROUTER_KEY ? 'openrouter' : null;
+const MODEL = OPENROUTER_MODEL;
+export const aiConfigured = Boolean(OPENROUTER_KEY);
 
 const TIMEOUT_MS = 45_000;
 const SEVERITIES = ['LOW', 'MEDIUM', 'HIGH'];
@@ -28,19 +29,19 @@ const LANGS = { hi: 'Hindi', mr: 'Marathi', pa: 'Punjabi', gu: 'Gujarati', te: '
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function assertConfigured() {
-  if (!aiConfigured) throw new Error('AI Crop Doctor is not configured. Set GEMINI_API_KEY (or GROQ_API_KEY) on the server.');
+  if (!aiConfigured) throw new Error('AI Crop Doctor is not configured. Set OPENROUTER_API_KEY on the server.');
 }
 
 function providerError(status, detail = '') {
   if (status === 429) return new Error('AI service is busy right now (rate limit reached). Please try again in a minute.');
-  if (status === 401 || status === 403) return new Error('AI service rejected the server API key. Ask an admin to check GEMINI_API_KEY / GROQ_API_KEY.');
+  if (status === 401 || status === 403) return new Error('OpenRouter rejected the server API key. Ask an admin to check OPENROUTER_API_KEY.');
   if (status === 400 && /image|inline|mime/i.test(detail)) return new Error('AI could not read this photo. Please upload a clear JPG or PNG image.');
   if (status >= 500) return new Error('AI service is temporarily unavailable. Please try again in a moment.');
   return new Error('AI request failed. Please try again.');
 }
 
 /** POST JSON with a timeout; retries once on network error, 429 or 5xx. */
-async function postJson(label, url, headers, body) {
+async function postJson(label, url, headers, body, { timeoutMs = TIMEOUT_MS, retries = 1 } = {}) {
   for (let attempt = 0; ; attempt += 1) {
     let res;
     try {
@@ -48,17 +49,17 @@ async function postJson(label, url, headers, body) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...headers },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(TIMEOUT_MS),
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (err) {
       if (err?.name === 'TimeoutError') throw new Error('AI service took too long to respond. Please try again.');
-      if (attempt === 0) { await sleep(1500); continue; }
+      if (attempt < retries) { await sleep(1500); continue; }
       throw new Error('Could not reach the AI service. Check the server internet connection and try again.');
     }
     if (res.ok) return res.json();
     const detail = await res.text().catch(() => '');
     console.error(`[ai:${label}] HTTP ${res.status} attempt=${attempt}: ${detail.slice(0, 400)}`);
-    if (attempt === 0 && (res.status === 429 || res.status >= 500)) { await sleep(res.status === 429 ? 3000 : 1500); continue; }
+    if (attempt < retries && (res.status === 429 || res.status >= 500)) { await sleep(res.status === 429 ? 3000 : 1500); continue; }
     throw providerError(res.status, detail);
   }
 }
@@ -67,33 +68,27 @@ async function postJson(label, url, headers, body) {
  * One generation call. `parts` is an array of { text } | { image: { base64, mime } }.
  * Returns the model's text.
  */
-async function generate(parts, { json = false, temperature = 0.3, maxTokens = 1200 } = {}) {
+async function generate(parts, { json = false, temperature = 0.3, maxTokens = 1200, timeoutMs = TIMEOUT_MS, retries = 1 } = {}) {
   assertConfigured();
-  if (PROVIDER === 'groq') {
-    const content = parts.map((p) => (p.image
-      ? { type: 'image_url', image_url: { url: `data:${p.image.mime};base64,${p.image.base64}` } }
-      : { type: 'text', text: p.text }));
-    const data = await postJson('groq', GROQ_URL, { Authorization: `Bearer ${GROQ_KEY}` }, {
-      model: GROQ_MODEL,
-      messages: [{ role: 'user', content }],
-      ...(json ? { response_format: { type: 'json_object' } } : {}),
-      temperature,
-      max_tokens: maxTokens,
-    });
-    return data?.choices?.[0]?.message?.content ?? '';
-  }
-  const data = await postJson('gemini', `${GEMINI}/${GEMINI_MODEL}:generateContent`, { 'x-goog-api-key': GEMINI_KEY }, {
-    contents: [{
-      role: 'user',
-      parts: parts.map((p) => (p.image ? { inline_data: { mime_type: p.image.mime, data: p.image.base64 } } : { text: p.text })),
-    }],
-    generationConfig: { temperature, maxOutputTokens: maxTokens, ...(json ? { responseMimeType: 'application/json' } : {}) },
-  });
-  const cand = data?.candidates?.[0];
-  const text = (cand?.content?.parts ?? []).map((p) => p.text ?? '').join('');
+  const content = parts.map((p) => (p.image
+    ? { type: 'image_url', image_url: { url: `data:${p.image.mime};base64,${p.image.base64}` } }
+    : { type: 'text', text: p.text }));
+  const headers = {
+    Authorization: `Bearer ${OPENROUTER_KEY}`,
+    ...(OPENROUTER_SITE ? { 'HTTP-Referer': OPENROUTER_SITE } : {}),
+    'X-OpenRouter-Title': OPENROUTER_APP,
+  };
+  const data = await postJson('openrouter', OPENROUTER_URL, headers, {
+    model: OPENROUTER_MODEL,
+    messages: [{ role: 'user', content }],
+    ...(json ? { response_format: { type: 'json_object' } } : {}),
+    temperature,
+    max_tokens: maxTokens,
+  }, { timeoutMs, retries });
+  const text = data?.choices?.[0]?.message?.content ?? '';
   if (!text) {
-    const why = data?.promptFeedback?.blockReason || cand?.finishReason || 'empty response';
-    console.error(`[ai:gemini] no text (${why})`);
+    const why = data?.choices?.[0]?.finish_reason || 'empty response';
+    console.error(`[ai:openrouter] no text (${why})`);
     throw new Error('AI could not analyse this input. Please try a clearer crop photo or add a short symptom description.');
   }
   return text;
@@ -254,17 +249,21 @@ const EXPERT = 'You are a senior plant pathologist and entomologist advising Ind
  * `catalog` defaults to the company product catalog for this crop.
  * Returns { disease, pathogen, confidence, severity, symptoms, recommendation, productIds, source }.
  */
-export async function diagnoseCrop({ crop, imageUrl, references = [], lang, symptoms, catalog }) {
+export async function diagnoseCrop({ crop, imageUrl, references = [], lang, symptoms, catalog, fast = false }) {
   assertConfigured();
-  const cat = catalog ?? await loadCatalog(crop);
+  const refs = imageUrl ? references.slice(0, 4) : [];
+  const [cat, farmerImage, referenceImages] = await Promise.all([
+    catalog ?? loadCatalog(crop),
+    imageUrl ? toInlineData(imageUrl) : null,
+    Promise.all(refs.map((r) => toInlineData(r.imageUrl).catch(() => null))),
+  ]);
   const language = LANGS[lang];
   const parts = [{ text: `${EXPERT}\nCrop reported by the farmer: ${crop}.${symptoms ? `\nFarmer's description: ${symptoms}` : ''}` }];
 
   let usedRefs = 0;
-  const refs = imageUrl ? references.slice(0, 4) : [];
   if (refs.length) {
     parts.push({ text: `Labelled REFERENCE photos of known ${crop} conditions from our field library (use them to ground your judgement):` });
-    const imgs = await Promise.all(refs.map((r) => toInlineData(r.imageUrl).catch(() => null)));
+    const imgs = referenceImages;
     refs.forEach((r, i) => {
       if (!imgs[i]) return;
       parts.push({ text: `Reference — ${r.disease}${r.pathogen ? ` (${r.pathogen})` : ''}${r.caption ? `: ${r.caption}` : ''}` }, { image: imgs[i] });
@@ -275,7 +274,7 @@ export async function diagnoseCrop({ crop, imageUrl, references = [], lang, symp
   }
 
   if (imageUrl) {
-    parts.push({ text: `Now diagnose THIS photo of the farmer's ${crop} crop.` }, { image: await toInlineData(imageUrl) });
+    parts.push({ text: `Now diagnose THIS photo of the farmer's ${crop} crop.` }, { image: farmerImage });
   } else {
     parts.push({ text: 'No photo was provided: diagnose the most likely problem from the crop, the description and the current Indian season, and keep confidence at or below 60.' });
   }
@@ -298,14 +297,17 @@ Respond with JSON only:
   "productCodes": up to 3 catalog codes (e.g. ["P2"]) that match the chemical/biological advice, or []
 }${language ? `\nWrite every text value in ${language}; keep JSON keys, codes and scientific names in English.` : ''}` });
 
-  const j = await generateJson(parts, { temperature: 0.2, maxTokens: 1200 });
+  const j = await generateJson(parts, { temperature: 0.2, maxTokens: 1200, ...(fast ? { timeoutMs: 25_000, retries: 0 } : {}) });
   const disease = str(j.disease);
   if (!disease) throw new Error('AI returned an incomplete answer. Please try again.');
   let confidence = Number(j.confidence) || 0;
   if (confidence > 0 && confidence <= 1) confidence *= 100;
   const severity = String(j.severity ?? '').toUpperCase();
+  const labels = lang === 'hi'
+    ? ['कारण', 'खेत प्रबंधन', 'जैविक उपाय', 'रासायनिक उपाय', 'सुरक्षा और प्रतीक्षा अवधि']
+    : ['Cause', 'Cultural', 'Biological', 'Chemical', 'Safety & PHI'];
   const recommendation = [
-    ['Cause', j.cause], ['Cultural', j.cultural], ['Biological', j.biological], ['Chemical', j.chemical], ['Safety & PHI', j.safety],
+    [labels[0], j.cause], [labels[1], j.cultural], [labels[2], j.biological], [labels[3], j.chemical], [labels[4], j.safety],
   ].map(([k, v]) => (str(v) ? `${k}: ${decodeCodes(str(v), cat)}` : null)).filter(Boolean).join('\n') || str(j.recommendation);
 
   return {

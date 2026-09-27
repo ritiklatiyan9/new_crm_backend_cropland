@@ -1,5 +1,5 @@
 // GraphQL module: on-the-fly machine translation of dynamic content, cached in
-// `mt_cache` (translate-once via Gemini, then serve from DB). Used by the
+// `mt_cache` (translate once via OpenRouter Gemini, then serve from DB). Used by the
 // Farmer App to show data — not just UI labels — in the chosen language.
 
 import crypto from 'node:crypto';
@@ -36,7 +36,7 @@ export function translateResolvers() {
           );
           for (const r of cached.rows) result.set(r.source_text, r.translated);
 
-          // 2) Translate the misses via Gemini (chunked) and persist them.
+          // 2) Translate the misses via OpenRouter Gemini (chunked) and persist them.
           const misses = uniq.filter((t) => !result.has(t));
           for (let i = 0; i < misses.length; i += CHUNK) {
             const chunk = misses.slice(i, i + CHUNK);

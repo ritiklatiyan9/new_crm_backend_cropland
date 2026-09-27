@@ -1,12 +1,13 @@
-// Machine-translation service — translates dynamic content via Google Gemini.
+// Machine-translation service — translates dynamic content with Gemini through
+// OpenRouter, using the same provider/model configuration as AI Crop Doctor.
 // Used by the `translate` GraphQL query, which caches results in `mt_cache` so
 // each phrase is sent to Gemini only once (translate-once, then serve-from-DB).
 
 import { env } from '../../config/env.js';
 
-const KEY = env.ai?.geminiApiKey || process.env.GEMINI_API_KEY || '';
-const MODEL = env.ai?.geminiModel || 'gemini-2.5-flash';
-const GEMINI = 'https://generativelanguage.googleapis.com/v1beta/models';
+const KEY = env.ai?.openRouterApiKey || process.env.OPENROUTER_API_KEY || '';
+const MODEL = env.ai?.openRouterModel || process.env.OPENROUTER_MODEL || 'google/gemini-3.1-flash-lite';
+const URL = 'https://openrouter.ai/api/v1/chat/completions';
 
 export const translateConfigured = Boolean(KEY);
 
@@ -31,7 +32,7 @@ function extractJsonArray(text) {
 }
 
 /**
- * Translate an array of strings into the target language via Gemini.
+ * Translate an array of strings into the target language via OpenRouter Gemini.
  * Returns an array aligned with the input; on any failure the originals are
  * returned so the UI degrades gracefully (English).
  */
@@ -48,17 +49,23 @@ export async function translateBatch(texts, lang) {
     `Input:\n${JSON.stringify(texts)}`;
 
   try {
-    const res = await fetch(`${GEMINI}/${MODEL}:generateContent?key=${KEY}`, {
+    const res = await fetch(URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${KEY}`,
+        ...(env.ai?.openRouterSiteUrl ? { 'HTTP-Referer': env.ai.openRouterSiteUrl } : {}),
+        'X-OpenRouter-Title': env.ai?.openRouterAppName || 'Cropland CRM',
+      },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.2, responseMimeType: 'application/json' },
+        model: MODEL,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.2,
       }),
     });
     if (!res.ok) return texts;
     const data = await res.json();
-    const out = extractJsonArray(data?.candidates?.[0]?.content?.parts?.[0]?.text);
+    const out = extractJsonArray(data?.choices?.[0]?.message?.content);
     if (!out || out.length !== texts.length) return texts;
     return out;
   } catch {

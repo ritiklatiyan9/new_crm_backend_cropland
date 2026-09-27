@@ -159,37 +159,55 @@ export function enquiryResolvers() {
     Mutation: {
       createPurchaseEnquiry: async (_p, { productId, lat, lng, note }, ctx) => {
         const id = farmerId(ctx);
-        const farmer = (await query('SELECT gps_lat, gps_lng, district, state FROM farmers WHERE id=$1', [id])).rows[0];
-        const product = (await query('SELECT name FROM products WHERE id=$1', [productId])).rows[0];
+        const [farmerResult, productResult, settingsResult] = await Promise.all([
+          query('SELECT gps_lat, gps_lng, district, state FROM farmers WHERE id=$1', [id]),
+          query('SELECT name FROM products WHERE id=$1', [productId]),
+          query('SELECT distributor_suggestion s FROM company_settings WHERE id=1'),
+        ]);
+        const farmer = farmerResult.rows[0];
+        const product = productResult.rows[0];
         if (!product) throw httpError('Product not found', 404);
 
         // Capture the farmer's live location if the app sent it.
         let la = lat, ln = lng;
-        if (la != null && ln != null) {
-          await query('UPDATE farmers SET gps_lat=$2, gps_lng=$3 WHERE id=$1', [id, la, ln]);
-        } else {
+        const locationUpdate = la != null && ln != null
+          ? query('UPDATE farmers SET gps_lat=$2, gps_lng=$3 WHERE id=$1', [id, la, ln])
+          : Promise.resolve();
+        if (la == null || ln == null) {
           la = num(farmer?.gps_lat); ln = num(farmer?.gps_lng);
         }
 
-        const suggestionEnabled = ((await query('SELECT distributor_suggestion s FROM company_settings WHERE id=1')).rows[0]?.s) ?? true;
-        let distributor = null;
-        let distanceKm = null;
-        if (suggestionEnabled) {
-          if (la != null && ln != null) {
-            const near = await nearestByGps(la, ln, 1);
-            if (near[0]) { distributor = near[0]; distanceKm = Math.round(num(near[0].dist) * 10) / 10; }
+        const suggestionEnabled = settingsResult.rows[0]?.s ?? true;
+        const distributorLookup = (async () => {
+          let distributor = null;
+          let distanceKm = null;
+          if (suggestionEnabled) {
+            if (la != null && ln != null) {
+              const near = await nearestByGps(la, ln, 1);
+              if (near[0]) { distributor = near[0]; distanceKm = Math.round(num(near[0].dist) * 10) / 10; }
+            }
+            distributor ??= await nearestByRegion(farmer?.district, farmer?.state);
           }
-          distributor ??= await nearestByRegion(farmer?.district, farmer?.state);
-        }
+          return { distributor, distanceKm };
+        })();
 
-        const enquiryNo = `ENQ-${String((await query("SELECT nextval('enquiry_seq') n")).rows[0].n).padStart(5, '0')}`;
+        const [match, sequenceResult] = await Promise.all([
+          distributorLookup,
+          query("SELECT nextval('enquiry_seq') n"),
+          locationUpdate,
+        ]);
+        const { distributor, distanceKm } = match;
+        const enquiryNo = `ENQ-${String(sequenceResult.rows[0].n).padStart(5, '0')}`;
         const { rows } = await query(
           `INSERT INTO purchase_enquiries (enquiry_no, farmer_id, product_id, product_name, distributor_id, distance_km, note)
            VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
           [enquiryNo, id, productId, product.name, distributor?.id ?? null, distanceKm, note ?? null],
         );
-        await logActivity(null, 'PURCHASE_ENQUIRY', 'purchase_enquiry', rows[0].id, { product: product.name, via: 'farmer-app' });
-        const full = mapEnquiry((await query(`${ENQ_SELECT} WHERE e.id=$1`, [rows[0].id])).rows[0]);
+        const [, fullResult] = await Promise.all([
+          logActivity(null, 'PURCHASE_ENQUIRY', 'purchase_enquiry', rows[0].id, { product: product.name, via: 'farmer-app' }),
+          query(`${ENQ_SELECT} WHERE e.id=$1`, [rows[0].id]),
+        ]);
+        const full = mapEnquiry(fullResult.rows[0]);
         return { enquiry: full, suggestionEnabled, distributor: full.distributor };
       },
 

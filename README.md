@@ -97,6 +97,7 @@ All write/admin operations are role-guarded and recorded in `activity_logs`.
 
 ## Notes
 
-- AWS S3/SES utilities (`src/utils/aws.js`) and the presigned-upload routes are
-  in place for later modules; Gemini, OpenWeather, Razorpay, MSG91 keys remain
-  placeholders in `.env` for later PRD phases (§12).
+- AI Crop Doctor and dynamic translations use OpenRouter with
+  `OPENROUTER_MODEL=google/gemini-3.1-flash-lite`. Set `OPENROUTER_API_KEY` in
+  the deployment environment; the optional direct `GEMINI_API_KEY` is used only
+  for training-image embeddings. OpenWeather, Razorpay and MSG91 remain optional.

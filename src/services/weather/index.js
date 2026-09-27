@@ -3,13 +3,17 @@
 // Computes Rain / Heat / Frost / Spray-window alerts from the data.
 
 import { env } from '../../config/env.js';
+import { createAsyncCache } from '../../utils/asyncCache.js';
 
 const KEY = env.weather?.apiKey || process.env.OPENWEATHER_API_KEY || '';
 export const weatherConfigured = Boolean(KEY);
 
 const OWM = 'https://api.openweathermap.org';
+const CACHE_TTL_MS = 10 * 60 * 1000;
+const weatherCache = createAsyncCache({ maxEntries: 256 });
+const geoCache = createAsyncCache({ maxEntries: 256 });
 
-async function getJson(url, ms = 8000) {
+async function getJson(url, ms = 4500) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
   try {
@@ -59,20 +63,20 @@ function mockWeather(label) {
 }
 
 // ── Alert computation ────────────────────────────────────────
-function computeAlerts(current, forecast) {
+export function computeAlerts(current, forecast) {
   const alerts = [];
   const next = forecast[0] ?? {};
 
   // Decide spray guidance ONCE so we never emit contradictory advice
   // (e.g. "postpone spraying" alongside "ideal for spraying").
-  const rainSoon = (current.rain1h ?? 0) > 5 || (next.rainMm ?? 0) > 5;
+  const rainSoon = (current.rain1h ?? 0) > 0 || (next.rainMm ?? 0) > 0 || (next.rainProb ?? 0) >= 40;
   const heat     = current.temp > 40;
   const frost    = Math.min(current.temp, next.min ?? current.temp) < 5;
-  const noRainSoon = (current.rain1h ?? 0) === 0 && (next.rainMm ?? 0) <= 1;
-  const calmWind   = current.windSpeed < 10;
+  const noRainSoon = forecast.length > 0 && !rainSoon;
+  const calmWind = current.windSpeed >= 1 && current.windSpeed < 4;
 
   if (rainSoon) {
-    alerts.push({ type: 'RAIN', severity: 'HIGH', title: 'Rain expected', detail: 'Rainfall > 5mm — postpone spraying until the rain clears.' });
+    alerts.push({ type: 'RAIN', severity: 'MEDIUM', title: 'Rain in the forecast', detail: 'Check rainfall timing and the product label’s rain-free interval before planning a spray.' });
   }
   if (heat) {
     alerts.push({ type: 'HEAT', severity: 'HIGH', title: 'Heat stress', detail: 'Temperature above 40°C — irrigate and spray only in the early morning or evening, never at mid-day.' });
@@ -81,8 +85,8 @@ function computeAlerts(current, forecast) {
     alerts.push({ type: 'FROST', severity: 'MEDIUM', title: 'Frost risk', detail: 'Temperature below 5°C — protect vegetable crops.' });
   }
   // Only suggest a good spray window when nothing else advises against spraying.
-  if (!rainSoon && !heat && noRainSoon && calmWind) {
-    alerts.push({ type: 'SPRAY_WINDOW', severity: 'LOW', title: 'Good spray window', detail: 'Low wind and no rain expected soon — ideal for spraying in the next few hours.' });
+  if (!rainSoon && !heat && !frost && noRainSoon && calmWind) {
+    alerts.push({ type: 'SPRAY_WINDOW', severity: 'LOW', title: 'Review spray conditions', detail: 'No rain is forecast in the next daily period. Check wind at your field and follow the product label before spraying.' });
   }
   return alerts;
 }
@@ -98,14 +102,14 @@ function addDates(forecast) {
 }
 
 /** Fetch weather for a place (city/village string or lat/lon). `lang` localizes descriptions (e.g. 'hi'). */
-export async function getWeather({ city, lat, lon, lang }) {
+async function fetchWeather({ city, lat, lon, lang }) {
   const label = city || (lat != null ? `${lat},${lon}` : 'Unknown');
   const langQ = lang ? `&lang=${lang}` : '';
 
   if (!weatherConfigured) {
     const m = mockWeather(label);
     const forecast = addDates(m.forecast);
-    return { location: label, source: 'mock', current: m.current, forecast, alerts: computeAlerts(m.current, forecast) };
+    return { location: label, source: 'mock', current: m.current, forecast, alerts: [] };
   }
 
   try {
@@ -113,18 +117,21 @@ export async function getWeather({ city, lat, lon, lang }) {
     let plon = lon;
     let name = label;
     if (plat == null && city) {
-      const geo = await getJson(`${OWM}/geo/1.0/direct?q=${encodeURIComponent(city)}&limit=1&appid=${KEY}`);
+      const geo = await geoCache.get(`city:${city.toLowerCase()}`, () => getJson(`${OWM}/geo/1.0/direct?q=${encodeURIComponent(city)}&limit=1&appid=${KEY}`, 2500), 86_400_000);
       if (!geo.length) throw new Error('Location not found');
       plat = geo[0].lat; plon = geo[0].lon; name = `${geo[0].name}, ${geo[0].country}`;
-    } else if (plat != null) {
-      // Reverse-geocode coordinates → nearest village/town name (instead of showing lat,lon).
-      try {
-        const rev = await getJson(`${OWM}/geo/1.0/reverse?lat=${plat}&lon=${plon}&limit=1&appid=${KEY}`);
-        if (rev.length) name = [rev[0].name, rev[0].state].filter(Boolean).join(', ');
-      } catch { /* keep coord label */ }
     }
-    const cur = await getJson(`${OWM}/data/2.5/weather?lat=${plat}&lon=${plon}&units=metric${langQ}&appid=${KEY}`);
-    const fc = await getJson(`${OWM}/data/2.5/forecast?lat=${plat}&lon=${plon}&units=metric${langQ}&appid=${KEY}`);
+    // Current conditions, forecast and reverse geocoding are independent. Run
+    // them together instead of paying for three sequential network round-trips.
+    const reverse = plat != null
+      ? geoCache.get(`gps:${Number(plat).toFixed(2)},${Number(plon).toFixed(2)}`, () => getJson(`${OWM}/geo/1.0/reverse?lat=${plat}&lon=${plon}&limit=1&appid=${KEY}`, 800), 86_400_000).catch(() => [])
+      : Promise.resolve([]);
+    const [rev, cur, fc] = await Promise.all([
+      reverse,
+      getJson(`${OWM}/data/2.5/weather?lat=${plat}&lon=${plon}&units=metric${langQ}&appid=${KEY}`),
+      getJson(`${OWM}/data/2.5/forecast?lat=${plat}&lon=${plon}&units=metric${langQ}&appid=${KEY}`),
+    ]);
+    if (rev.length) name = [rev[0].name, rev[0].state].filter(Boolean).join(', ');
 
     const current = {
       temp: cur.main.temp, feelsLike: cur.main.feels_like, humidity: cur.main.humidity,
@@ -149,6 +156,22 @@ export async function getWeather({ city, lat, lon, lang }) {
     // Fall back to mock on any API failure so the screen still renders.
     const m = mockWeather(label);
     const forecast = addDates(m.forecast);
-    return { location: label, source: 'mock', current: m.current, forecast, alerts: computeAlerts(m.current, forecast) };
+    return { location: label, source: 'mock', current: m.current, forecast, alerts: [] };
   }
+}
+
+function weatherKey({ city, lat, lon, lang }) {
+  if (lat != null && lon != null) return `gps:${Number(lat).toFixed(2)},${Number(lon).toFixed(2)}:${lang || 'en'}`;
+  return `city:${String(city || 'India').trim().toLowerCase()}:${lang || 'en'}`;
+}
+
+/** Cached + request-deduplicated public adapter. Weather changes slowly enough
+ * that a ten-minute cache gives a much faster home screen without stale advice. */
+export function getWeather(args) {
+  if ((args.lat == null) !== (args.lon == null) || (args.lat != null &&
+      (!Number.isFinite(args.lat) || !Number.isFinite(args.lon) || Math.abs(args.lat) > 90 || Math.abs(args.lon) > 180))) {
+    return Promise.reject(new Error('Invalid weather coordinates'));
+  }
+  return weatherCache.get(weatherKey(args), () => fetchWeather(args),
+    (value) => value.source === 'mock' && weatherConfigured ? 30_000 : CACHE_TTL_MS);
 }

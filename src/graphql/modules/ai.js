@@ -100,7 +100,7 @@ export const aiTypeDefs = /* GraphQL */ `
   }
   type VectorStoreStatus { provider: String!, configured: Boolean!, ready: Boolean!, index: String!, namespace: String!, vectorCount: Int }
   type ReindexResult { total: Int!, processed: Int!, failed: Int! }
-  type TrainingStats { classes: Int!, samples: Int!, crops: Int!, aiConfigured: Boolean!, model: String!, embeddingModel: String!, vectorStore: VectorStoreStatus! }
+  type TrainingStats { classes: Int!, samples: Int!, crops: Int!, aiConfigured: Boolean!, provider: String!, model: String!, embeddingModel: String!, vectorStore: VectorStoreStatus! }
 
   input TrainingClassInput { crop: String!, disease: String!, pathogen: String, description: String, symptoms: String, treatment: String, productIds: [ID!] }
   input TrainingSampleInput { imageUrl: String!, imageKey: String, caption: String }
@@ -219,16 +219,18 @@ const blank = (v) => (typeof v === 'string' ? v.trim() || null : v ?? null);
 //   1. Pinecone vector search (scales to large training sets)
 //   2. Postgres + in-memory cosine over cached Gemini embeddings
 //   3. Most-recent labelled examples (still grounds the model, just not ranked)
-export async function getTrainingReferences(crop, queryImageUrl) {
+export async function getTrainingReferences(crop, queryImageUrl, { fast = false } = {}) {
   // Postgres holds every trained sample (Pinecone mirrors it), so no rows = nothing to
   // retrieve: skip the caption + embedding round-trips entirely.
   const { rows } = await query(
     `SELECT s.id, s.image_url, s.vision_caption, s.embedding, c.disease, c.pathogen
      FROM ai_training_samples s JOIN ai_training_classes c ON c.id = s.class_id
-     WHERE c.is_active AND c.crop ILIKE $1 ORDER BY s.created_at DESC`,
+     WHERE c.is_active AND c.crop ILIKE $1 ORDER BY s.created_at DESC ${fast ? 'LIMIT 4' : ''}`,
     [crop],
   );
   if (!rows.length) return { references: [], retrieval: 'none', topScore: 0 };
+  // Mobile capture uses four recent labelled examples without a separate caption/embedding call.
+  if (fast) return { references: rows.map((r) => ({ imageUrl: r.image_url, caption: r.vision_caption, disease: r.disease, pathogen: r.pathogen })), retrieval: 'recent', topScore: 0 };
 
   // Embed the farmer's photo once; reused by both the Pinecone and in-memory paths.
   const q = queryImageUrl ? await embedSample(queryImageUrl, crop, crop) : null;
@@ -491,7 +493,7 @@ export function aiResolvers() {
         const st = aiChannelStatus();
         const vs = await vectorStoreStatus(); // cached — Pinecone stats are slow round-trips
         return {
-          ...rows[0], aiConfigured: st.configured, model: st.model, embeddingModel: st.embeddingModel,
+          ...rows[0], aiConfigured: st.configured, provider: st.provider, model: st.model, embeddingModel: st.embeddingModel,
           vectorStore: {
             provider: vs.provider, configured: vs.configured, ready: vs.ready,
             index: vs.index, namespace: vs.namespace, vectorCount: vs.vectorCount,

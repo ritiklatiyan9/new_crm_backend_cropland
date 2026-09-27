@@ -1,9 +1,12 @@
+import { readPurchases } from '../../services/farmer/purchases.js';
 // GraphQL module: Farmer App backend (PRD §9).
 // Farmer authentication (email/password + Google) and farmer-scoped data —
 // the same `farmers` table used by the admin panel, so admin-created farmers and
 // app self-signups are one and the same record.
 
 import bcrypt from 'bcryptjs';
+import { createCatalog } from '../../services/farmer/catalog.js';
+import { cropPhotoInput } from '../../services/farmer/cropPhoto.js';
 import { query } from '../../db/index.js';
 import { assertAuth } from '../context.js';
 import { httpError, logActivity, num, isoDate } from '../helpers.js';
@@ -12,6 +15,7 @@ import { diagnoseCrop } from '../../services/ai/index.js';
 import { getTrainingReferences } from './ai.js';
 import { isAwsConfigured, getDownloadUrl } from '../../utils/aws.js';
 import { env } from '../../config/env.js';
+import { sendEmail } from '../../services/notify/email.js';
 
 // Resolve a stored S3 key (or pass-through URL) to a viewable URL.
 async function imgUrl(value) {
@@ -39,6 +43,7 @@ export const farmerAppTypeDefs = /* GraphQL */ `
     pointsBalance: Int!
     photoUrl: String
     authProvider: String!
+    deletionStatus: String
   }
   type FarmerAuthPayload { token: String!, farmer: FarmerProfile! }
 
@@ -61,8 +66,9 @@ export const farmerAppTypeDefs = /* GraphQL */ `
     items: [AppPurchaseLine!]!
   }
   type AppProduct { id: ID!, name: String!, category: String, technicalName: String, uom: String, packingSize: String, mrp: Float, imageUrl: String, recommendedDosage: String, applicationFrequency: String, targetCrops: [String!]!, targetDiseases: [String!]! }
+  type AppDiagnosisProduct { id: ID!, name: String! }
   type AppNotification { id: ID!, title: String!, body: String!, campaignType: String, createdAt: DateTime! }
-  type AppDiagnosis { id: ID!, sessionNo: String!, crop: String!, detectedDisease: String, pathogen: String, confidence: Float, severity: String, symptoms: String, recommendation: String, source: String, products: [String!]!, imageUrl: String, createdAt: DateTime! }
+  type AppDiagnosis { id: ID!, sessionNo: String!, crop: String!, detectedDisease: String, pathogen: String, confidence: Float, severity: String, symptoms: String, recommendation: String, source: String, products: [String!]!, recommendedProducts: [AppDiagnosisProduct!]!, imageUrl: String, createdAt: DateTime! }
 
   input FarmerSignupInput { name: String!, email: String!, password: String!, phone: String, village: String, district: String, state: String, language: String }
   input FarmerProfileInput { name: String, phone: String, village: String, tehsil: String, district: String, state: String, crops: [String!], landSizeAcres: Float, language: String }
@@ -77,8 +83,8 @@ export const farmerAppTypeDefs = /* GraphQL */ `
     myPurchases: [AppPurchase!]!
     myDiagnoses: [AppDiagnosis!]!
     myNotifications(limit: Int = 50): [AppNotification!]!
-    appProducts(search: String, limit: Int = 100): [AppProduct!]!
-    appWeather(lat: Float, lng: Float): Weather!
+    appProducts(search: String, category: String, limit: Int = 100, offset: Int = 0): [AppProduct!]!
+    appWeather(lat: Float, lng: Float, language: String): Weather!
     myAccountSummary: AccountSummary!
   }
 
@@ -91,8 +97,9 @@ export const farmerAppTypeDefs = /* GraphQL */ `
     registerMyDevice(fcmToken: String!): Boolean!
     setMyProfilePhoto(imageUrl: String!): FarmerProfile!
     raiseComplaint(input: AppComplaintInput!): AppComplaint!
-    runMyDiagnosis(crop: String!, imageUrl: String): AppDiagnosis!
+    runMyDiagnosis(crop: String!, imageUrl: String, language: String): AppDiagnosis!
     markAdvisoryRead(id: ID!): Boolean!
+    requestMyAccountDeletion(reason: String): Boolean!
   }
 `;
 
@@ -103,6 +110,7 @@ const mapFarmer = (r) => r && {
   village: r.village, tehsil: r.tehsil, district: r.district, state: r.state,
   crops: r.crops ?? [], landSizeAcres: num(r.land_size_acres), language: r.language,
   pointsBalance: r.points_balance ?? 0, photoKey: r.photo_url, authProvider: r.auth_provider ?? 'ADMIN',
+  deletionStatus: r.deletion_status ?? null,
 };
 
 // Resolve the authenticated farmer's id from a FARMER-kind JWT.
@@ -116,6 +124,13 @@ async function productNames(ids) {
   if (!ids?.length) return [];
   const { rows } = await query('SELECT name FROM products WHERE id = ANY($1)', [ids]);
   return rows.map((r) => r.name);
+}
+
+async function productRefs(ids) {
+  if (!ids?.length) return [];
+  const { rows } = await query('SELECT id, name FROM products WHERE id = ANY($1)', [ids]);
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  return ids.map((id) => byId.get(id)).filter(Boolean);
 }
 
 // One lookup for every row's product_ids (avoids a products query per advisory/diagnosis).
@@ -144,6 +159,7 @@ async function matchProductsForApp(crop, disease) {
 }
 
 export function farmerAppResolvers(app) {
+  const catalog = createCatalog(query);
   // Mobile apps need long-lived tokens; 30-day expiry replaces the default 15-min access window.
   const sign = (farmer) => app.jwt.sign({ sub: farmer.id, kind: 'FARMER', role: 'FARMER' }, { expiresIn: '30d' });
   const authPayload = (farmer) => ({ token: sign(farmer), farmer: mapFarmer(farmer) });
@@ -178,10 +194,9 @@ export function farmerAppResolvers(app) {
       myAccountSummary: async (_p, _a, ctx) => {
         const id = farmerId(ctx);
         const { rows } = await query(
-          `SELECT COALESCE((SELECT SUM(total_amount) FROM invoices WHERE farmer_id=$1),0)
-                    + COALESCE((SELECT SUM(total_amount) FROM party_sales WHERE farmer_id=$1),0) total_purchased,
-                  COALESCE((SELECT SUM(amount_paid) FROM invoices WHERE farmer_id=$1),0)
-                    + COALESCE((SELECT SUM(amount_paid) FROM party_sales WHERE farmer_id=$1),0) total_paid`,
+          `SELECT COALESCE(SUM(total_amount),0) total_purchased, COALESCE(SUM(amount_paid),0) total_paid
+           FROM (SELECT total_amount, amount_paid FROM invoices WHERE farmer_id=$1
+                 UNION ALL SELECT total_amount, amount_paid FROM party_sales WHERE farmer_id=$1) purchases`,
           [id],
         );
         const tp = num(rows[0].total_purchased) ?? 0, paid = num(rows[0].total_paid) ?? 0;
@@ -200,49 +215,7 @@ export function farmerAppResolvers(app) {
       // Unified purchase history: GST/Non-GST orders + direct sales, each with its
       // product line items and payment status. Powers the Purchases screen and the
       // per-product transaction sheet in the farmer app.
-      myPurchases: async (_p, _a, ctx) => {
-        const id = farmerId(ctx);
-        const round2 = (n) => Math.round(n * 100) / 100;
-        const mapLine = (l) => ({ productName: l.product_name, quantity: num(l.quantity), unitPrice: num(l.unit_price), lineTotal: num(l.line_total), uom: l.uom ?? null, packingSize: l.packing_size ?? null });
-        const out = [];
-
-        // Headers + all their lines in 4 parallel queries (was one lines query per document).
-        const [orders, orderLines, sales, saleLines] = (await Promise.all([
-          query(
-            `SELECT o.id, o.order_no, o.order_date, o.status, o.total_amount,
-                    COALESCE((SELECT SUM(amount_paid) FROM invoices i WHERE i.order_id = o.id), 0) paid
-             FROM orders o WHERE o.farmer_id = $1 ORDER BY o.created_at DESC`,
-            [id],
-          ),
-          query(
-            `SELECT l.order_id parent_id, l.product_name, l.quantity, l.unit_price, l.line_total, l.uom, l.packing_size
-             FROM order_lines l JOIN orders o ON o.id = l.order_id WHERE o.farmer_id = $1`,
-            [id],
-          ),
-          query('SELECT id, sale_no, sale_date, total_amount, amount_paid FROM party_sales WHERE farmer_id = $1 ORDER BY created_at DESC', [id]),
-          query(
-            `SELECT l.sale_id parent_id, l.product_name, l.quantity, l.unit_price, l.line_total, p.uom,
-                    COALESCE(l.packing_size, p.packing_size) packing_size
-             FROM party_sale_lines l JOIN party_sales s ON s.id = l.sale_id LEFT JOIN products p ON p.id = l.product_id
-             WHERE s.farmer_id = $1`,
-            [id],
-          ),
-        ])).map((r) => r.rows);
-        const group = (lines) => lines.reduce((m, l) => m.set(l.parent_id, [...(m.get(l.parent_id) ?? []), mapLine(l)]), new Map());
-        const oLines = group(orderLines), sLines = group(saleLines);
-
-        for (const o of orders) {
-          const total = num(o.total_amount), paid = num(o.paid);
-          out.push({ id: o.id, refNo: o.order_no, kind: 'ORDER', date: isoDate(o.order_date), status: o.status, totalAmount: total, amountPaid: paid, balanceDue: round2(total - paid), items: oLines.get(o.id) ?? [] });
-        }
-        for (const s of sales) {
-          const total = num(s.total_amount), paid = num(s.amount_paid);
-          out.push({ id: s.id, refNo: s.sale_no, kind: 'DIRECT', date: isoDate(s.sale_date), status: paid >= total ? 'PAID' : (paid > 0 ? 'PARTIAL' : 'DUE'), totalAmount: total, amountPaid: paid, balanceDue: round2(total - paid), items: sLines.get(s.id) ?? [] });
-        }
-
-        out.sort((a, b) => String(b.date).localeCompare(String(a.date)));
-        return out;
-      },
+      myPurchases: async (_p, _a, ctx) => readPurchases(query, farmerId(ctx)),
       myDiagnoses: async (_p, _a, ctx) => {
         const id = farmerId(ctx);
         const { rows } = await query('SELECT * FROM crop_diagnoses WHERE farmer_id = $1 ORDER BY created_at DESC LIMIT 50', [id]);
@@ -250,7 +223,7 @@ export function farmerAppResolvers(app) {
         return rows.map((r) => ({
           id: r.id, sessionNo: r.session_no, crop: r.crop, detectedDisease: r.detected_disease, pathogen: r.pathogen,
           confidence: num(r.confidence), severity: r.severity, symptoms: r.symptoms, recommendation: r.recommendation,
-          source: r.source, products: names(r), imageUrl: r.image_url, createdAt: r.created_at,
+          source: r.source, products: names(r), productIds: r.product_ids ?? [], imageUrl: r.image_url, createdAt: r.created_at,
         }));
       },
       myNotifications: async (_p, { limit }, ctx) => {
@@ -270,34 +243,39 @@ export function farmerAppResolvers(app) {
         );
         return rows.map((r) => ({ id: r.id, title: r.title, body: r.body, campaignType: r.campaign_type, createdAt: r.created_at }));
       },
-      appProducts: async (_p, { search, limit }, ctx) => {
+      appProducts: async (_p, args, ctx) => {
         farmerId(ctx);
-        const { rows } = await query(
-          `SELECT * FROM products WHERE is_active AND ($1::text IS NULL OR name ILIKE '%'||$1||'%' OR technical_name ILIKE '%'||$1||'%')
-           ORDER BY name LIMIT $2`,
-          [search ?? null, limit],
-        );
+        const rows = await catalog(args);
         return rows.map((r) => ({
           id: r.id, name: r.name, category: r.category, technicalName: r.technical_name, uom: r.uom, packingSize: r.packing_size,
           mrp: num(r.mrp), imageKey: r.image_key, recommendedDosage: r.recommended_dosage, applicationFrequency: r.application_frequency,
           targetCrops: r.target_crops ?? [], targetDiseases: r.target_diseases ?? [],
         }));
       },
-      appWeather: async (_p, { lat, lng }, ctx) => {
+      appWeather: async (_p, { lat, lng, language }, ctx) => {
         const id = farmerId(ctx);
+        if ((lat == null) !== (lng == null) || (lat != null && (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180))) {
+          throw httpError('Provide valid latitude and longitude together', 400);
+        }
         const f = (await query('SELECT village, district, state, gps_lat, gps_lng, language FROM farmers WHERE id = $1', [id])).rows[0];
         if (!f) throw httpError('Farmer not found', 404);
         // Prefer the device's live coordinates (and remember them); else stored GPS; else region name.
         let la = lat, ln = lng;
-        if (la != null && ln != null) {
-          await query('UPDATE farmers SET gps_lat=$2, gps_lng=$3 WHERE id=$1', [id, la, ln]);
-        } else {
+        const locationUpdate = la != null && ln != null
+          ? query('UPDATE farmers SET gps_lat=$2, gps_lng=$3 WHERE id=$1 AND (gps_lat IS DISTINCT FROM $2 OR gps_lng IS DISTINCT FROM $3)', [id, la, ln])
+          : Promise.resolve();
+        if (la == null || ln == null) {
           la = num(f.gps_lat); ln = num(f.gps_lng);
         }
-        const lang = f.language === 'hi' ? 'hi' : undefined; // localize OWM descriptions
-        const w = la != null && ln != null
-          ? await getWeather({ lat: la, lon: ln, lang })
-          : await getWeather({ city: [f.village, f.district, f.state].filter(Boolean).join(', ') || 'India', lang });
+        const city = f.district || f.village || f.state;
+        if ((la == null || ln == null) && !city) throw httpError('Add your village in Profile or use your location for local weather', 400);
+        const lang = ['en', 'hi'].includes(language) ? language : f.language === 'hi' ? 'hi' : 'en';
+        const [w] = await Promise.all([
+          la != null && ln != null
+            ? getWeather({ lat: la, lon: ln, lang })
+            : getWeather({ city: `${city},IN`, lang }),
+          locationUpdate,
+        ]);
         return { ...w, configured: weatherConfigured };
       },
     },
@@ -424,25 +402,28 @@ export function farmerAppResolvers(app) {
         return { id: r.id, ticketNo: r.ticket_no, category: r.category, description: r.description, status: r.status, priority: r.priority, resolutionNote: r.resolution_note, createdAt: r.created_at };
       },
 
-      runMyDiagnosis: async (_p, { crop, imageUrl }, ctx) => {
+      runMyDiagnosis: async (_p, { crop, imageUrl, language }, ctx) => {
         const id = farmerId(ctx);
-        const lang = (await query('SELECT language FROM farmers WHERE id=$1', [id])).rows[0]?.language;
+        const { analysisImage, storedImage } = cropPhotoInput(imageUrl);
         // Full RAG grounding: Pinecone → in-memory cosine → recent fallback (same as admin).
-        const { references } = await getTrainingReferences(crop, imageUrl);
-        const d = await diagnoseCrop({ crop, imageUrl, references, lang });
-        const productIds = await matchProductsForApp(crop, d.disease);
+        const { references } = await getTrainingReferences(crop, analysisImage, { fast: true });
+        // Farmer-facing diagnosis and management instructions are always Hindi.
+        const d = await diagnoseCrop({ crop, imageUrl: analysisImage, references, lang: language === 'en' ? 'en' : 'hi', fast: true });
+        // Prefer the model's catalog-grounded choices; only fall back when it did
+        // not select a matching Cropland product.
+        const productIds = d.productIds?.length ? d.productIds : await matchProductsForApp(crop, d.disease);
         const sessionNo = `CD-${String((await query("SELECT nextval('diag_seq') n")).rows[0].n).padStart(5, '0')}`;
         const { rows } = await query(
           `INSERT INTO crop_diagnoses (session_no, farmer_id, crop, image_url, detected_disease, pathogen, confidence, severity, symptoms, recommendation, product_ids, source)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
-          [sessionNo, id, crop, imageUrl ?? null, d.disease, d.pathogen, d.confidence, d.severity, d.symptoms, d.recommendation, productIds, d.source],
+          [sessionNo, id, crop, storedImage, d.disease, d.pathogen, d.confidence, d.severity, d.symptoms, d.recommendation, productIds, d.source],
         );
         await logActivity(null, 'CROP_DIAGNOSIS', 'crop_diagnosis', rows[0].id, { crop, via: 'farmer-app' });
         const r = rows[0];
         return {
           id: r.id, sessionNo: r.session_no, crop: r.crop, detectedDisease: r.detected_disease, pathogen: r.pathogen,
           confidence: num(r.confidence), severity: r.severity, symptoms: r.symptoms, recommendation: r.recommendation,
-          source: r.source, products: await productNames(productIds), imageUrl: r.image_url, createdAt: r.created_at,
+          source: r.source, products: await productNames(productIds), productIds, imageUrl: r.image_url, createdAt: r.created_at,
         };
       },
 
@@ -452,9 +433,43 @@ export function farmerAppResolvers(app) {
         await query("UPDATE advisories SET status='READ' WHERE id=$1 AND farmer_id=$2 AND status='SENT'", [id, fid]);
         return true;
       },
+
+      requestMyAccountDeletion: async (_p, { reason }, ctx) => {
+        const id = farmerId(ctx);
+        const cleanReason = reason?.trim() || null;
+        const { rows } = await query(
+          `UPDATE farmers SET
+             deletion_status = 'REQUESTED',
+             deletion_requested_at = COALESCE(deletion_requested_at, now()),
+             deletion_reason = $2,
+             updated_at = now()
+           WHERE id = $1 AND COALESCE(deletion_status,'') <> 'DELETED'
+           RETURNING farmer_code, name, email, phone`,
+          [id, cleanReason],
+        );
+        if (!rows[0]) throw httpError('Account not found', 404);
+        await logActivity(null, 'REQUEST_ACCOUNT_DELETION', 'farmer', id, { via: 'farmer-app', reason: cleanReason });
+        try {
+          const to = process.env.ACCOUNT_DELETION_NOTIFY_EMAIL || process.env.SMTP_USER;
+          if (to) {
+            const f = rows[0];
+            await sendEmail(
+              [to],
+              `Account deletion request — ${f.name} (${f.farmer_code})`,
+              `A farmer has requested account deletion from the app.\n\n`
+                + `Name: ${f.name}\nFarmer code: ${f.farmer_code}\n`
+                + `Email: ${f.email || '—'}\nPhone: ${f.phone || '—'}\n`
+                + `Reason: ${cleanReason || '—'}\n\n`
+                + 'Review it in Admin → Farmers → Account deletion requests.',
+            );
+          }
+        } catch { /* notification is best-effort */ }
+        return true;
+      },
     },
 
     FarmerProfile: { photoUrl: (parent) => imgUrl(parent.photoKey) },
+    AppDiagnosis: { recommendedProducts: (parent) => productRefs(parent.productIds) },
     AppProduct: { imageUrl: (parent) => imgUrl(parent.imageKey) },
     AppComplaint: {
       events: async (parent) => {

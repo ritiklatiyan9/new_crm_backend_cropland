@@ -1180,6 +1180,12 @@ ALTER TABLE farmers ADD COLUMN IF NOT EXISTS google_id TEXT;
 ALTER TABLE farmers ADD COLUMN IF NOT EXISTS photo_url TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_farmers_email_lower ON farmers (lower(email)) WHERE email IS NOT NULL;
 
+-- Farmer-initiated account deletion workflow (Google Play compliance).
+ALTER TABLE farmers ADD COLUMN IF NOT EXISTS deletion_status TEXT; -- NULL / REQUESTED / DELETED
+ALTER TABLE farmers ADD COLUMN IF NOT EXISTS deletion_requested_at TIMESTAMPTZ;
+ALTER TABLE farmers ADD COLUMN IF NOT EXISTS deletion_reason TEXT;
+CREATE INDEX IF NOT EXISTS idx_farmers_deletion_status ON farmers (deletion_status) WHERE deletion_status IS NOT NULL;
+
 -- ── Geolocation + buy-intent enquiries (distributor map + farmer "Buy") ──
 ALTER TABLE distributors ADD COLUMN IF NOT EXISTS gps_lat NUMERIC(10,7);
 ALTER TABLE distributors ADD COLUMN IF NOT EXISTS gps_lng NUMERIC(10,7);
@@ -1689,3 +1695,19 @@ ALTER TABLE purchase_invoices ADD COLUMN IF NOT EXISTS print_snapshot JSONB;
 ALTER TABLE vendors ADD COLUMN IF NOT EXISTS pan TEXT;
 ALTER TABLE vendors ADD COLUMN IF NOT EXISTS pincode TEXT;
 ALTER TABLE vendors ADD COLUMN IF NOT EXISTS invoice_defaults JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+-- Farmer app read paths. Existing installations should use
+-- node --env-file=.env scripts/farmer-performance.js --apply
+-- which builds these indexes concurrently instead of rerunning this schema.
+CREATE INDEX IF NOT EXISTS idx_app_products_active_name ON products (name, id) WHERE is_active;
+CREATE INDEX IF NOT EXISTS idx_app_products_active_category ON products (category, name, id) WHERE is_active;
+CREATE INDEX IF NOT EXISTS idx_app_invoices_farmer_totals ON invoices (farmer_id) INCLUDE (total_amount, amount_paid);
+CREATE INDEX IF NOT EXISTS idx_app_invoices_order ON invoices (order_id) INCLUDE (amount_paid);
+CREATE INDEX IF NOT EXISTS idx_app_orders_farmer_created ON orders (farmer_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_app_advisories_farmer_created ON advisories (farmer_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_app_complaints_farmer_created ON complaints (farmer_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_app_loyalty_farmer_created ON loyalty_transactions (farmer_id, created_at DESC);
+
+-- Nullable packing snapshots used by farmer purchase history.
+ALTER TABLE order_lines ADD COLUMN IF NOT EXISTS packing_size TEXT;
+ALTER TABLE party_sale_lines ADD COLUMN IF NOT EXISTS packing_size TEXT;
