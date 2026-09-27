@@ -12,23 +12,29 @@ async function authPlugin(fastify) {
     sign: { expiresIn: env.jwt.accessExpires },
   });
 
-  // Verify a bearer token; attaches payload to request.user.
-  fastify.decorate('authenticate', async function (request, reply) {
+  // Verify a bearer access token; attaches payload to request.user. Returns false after replying 401.
+  async function verify(request, reply) {
     try {
       await request.jwtVerify();
+      if (request.user?.type !== 'refresh') return true; // refresh tokens are not access tokens
     } catch (err) {
-      reply.code(401).send({ error: 'Unauthorized', message: 'Invalid or missing token' });
+      if (err.code === 'FST_JWT_AUTHORIZATION_TOKEN_EXPIRED') {
+        reply.code(401).send({ error: 'Unauthorized', code: 'UNAUTHENTICATED', message: 'Session expired' });
+        return false;
+      }
     }
+    reply.code(401).send({ error: 'Unauthorized', code: 'UNAUTHENTICATED', message: 'Invalid or missing token' });
+    return false;
+  }
+
+  fastify.decorate('authenticate', async function (request, reply) {
+    if (!(await verify(request, reply))) return reply;
   });
 
   // Factory: ensure the authenticated user holds one of the allowed roles.
   fastify.decorate('requireRole', function (...roles) {
     return async function (request, reply) {
-      try {
-        await request.jwtVerify();
-      } catch {
-        return reply.code(401).send({ error: 'Unauthorized' });
-      }
+      if (!(await verify(request, reply))) return reply;
       if (!roles.includes(request.user?.role)) {
         return reply.code(403).send({ error: 'Forbidden', message: 'Insufficient role' });
       }

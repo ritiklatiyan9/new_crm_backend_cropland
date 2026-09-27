@@ -71,3 +71,14 @@ test('GSTR-3B: net ITC mismatch ⇒ warning', () => {
   const r = validateGstr3bPayload(p);
   assert.ok(r.warnings.some((w) => /ITC net/.test(w)));
 });
+
+test('GSTR-1: split HSN (B2B/B2C) — missing UQC is an error, bad HSN length a warning', () => {
+  const p = { ...goodB2b, hsn: {
+    hsn_b2b: [{ num: 1, hsn_sc: '38089199', uqc: 'LTR', qty: 10, rt: 18, txval: 1000, iamt: 180, camt: 0, samt: 0, csamt: 0 }],
+    hsn_b2c: [{ num: 1, hsn_sc: '380', uqc: '', qty: 1, rt: 18, txval: 10, iamt: 0, camt: 0.9, samt: 0.9, csamt: 0 }],
+  } };
+  const r = validateGstr1Payload(p);
+  assert.ok(r.errors.some((e) => /HSN B2C .*UQC/.test(e)));
+  assert.ok(r.warnings.some((w) => /4, 6 or 8 digits/.test(w)));
+  assert.ok(!r.warnings.some((w) => /HSN B2B summary is empty/.test(w)));
+});

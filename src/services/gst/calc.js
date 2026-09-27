@@ -154,6 +154,21 @@ export function netLiability(output, itc) {
 }
 
 /**
+ * Cash liability per head after utilising ITC in the statutory order (s.49 / s.49A / Rule 88A):
+ * IGST credit → IGST, then CGST, then SGST; CGST credit → CGST, then IGST;
+ * SGST credit → SGST, then IGST. CGST and SGST credit never cross-utilise.
+ */
+export function utiliseItc(output, itc) {
+  const out = { igst: Number(output.igst || 0), cgst: Number(output.cgst || 0), sgst: Number(output.sgst || 0) };
+  const use = (credit, head) => { const u = Math.min(credit, out[head]); out[head] -= u; return credit - u; };
+  let i = Number(itc.igst || 0);
+  i = use(i, 'igst'); i = use(i, 'cgst'); use(i, 'sgst');
+  use(use(Number(itc.cgst || 0), 'cgst'), 'igst');
+  use(use(Number(itc.sgst || 0), 'sgst'), 'igst');
+  return { igst: roundGst(out.igst), cgst: roundGst(out.cgst), sgst: roundGst(out.sgst) };
+}
+
+/**
  * Interest u/s 50 (Rule 88B): 18% p.a. on net cash tax paid late, per head.
  * `days` = days past the due date. Returns rounded interest per head + total.
  */
@@ -164,8 +179,19 @@ export function interest88B({ igst = 0, cgst = 0, sgst = 0 }, days) {
   return { ...i, total: roundGst(i.igst + i.cgst + i.sgst) };
 }
 
-/** Late fee: ₹50/day (₹20/day for nil), capped, per the period. */
-export function lateFee(days, isNil = false, cap = 5000) {
+/** Late fee: ₹50/day (₹20/day for nil), capped (₹5,000; ₹500 for a nil return), per the period. */
+export function lateFee(days, isNil = false, cap = isNil ? 500 : 5000) {
   const d = Math.max(0, Number(days || 0));
   return Math.min(cap, d * (isNil ? 20 : 50));
+}
+
+/**
+ * E-way bill validity (Rule 138(10)): 1 day per 200 km (part thereof); a "day" ends
+ * at midnight (IST) of the day following generation. Returns the expiry instant.
+ */
+export function ewbValidUntil(generatedAt, distanceKm) {
+  const days = Math.max(1, Math.ceil(Number(distanceKm || 0) / 200));
+  const IST = 5.5 * 3600e3;
+  const ist = new Date(new Date(generatedAt).getTime() + IST);
+  return new Date(Date.UTC(ist.getUTCFullYear(), ist.getUTCMonth(), ist.getUTCDate() + days, 23, 59, 59) - IST);
 }

@@ -80,7 +80,7 @@ export const partyTypeDefs = /* GraphQL */ `
     summary: OutstandingSummary!
   }
 
-  type PartySaleLine { id: ID!, productId: ID!, productName: String!, batchNumber: String, quantity: Float!, unitPrice: Float!, gstPercent: Float!, lineTotal: Float! }
+  type PartySaleLine { id: ID!, productId: ID!, productName: String!, packingSize: String, batchNumber: String, quantity: Float!, unitPrice: Float!, gstPercent: Float!, lineTotal: Float! }
   type PartySale {
     id: ID!
     saleNo: String!
@@ -270,7 +270,7 @@ export function partyResolvers() {
            WHERE ($1::text IS NULL OR p.party_type = $1)
              AND ($2::text IS NULL OR p.name ILIKE '%'||$2||'%' OR p.phone ILIKE '%'||$2||'%' OR p.gstin ILIKE '%'||$2||'%')
            ORDER BY p.name LIMIT $3`,
-          [type ?? null, search ?? null, limit],
+          [type || null, search?.trim() || null, Math.min(Math.max(limit ?? 200, 1), 1000)],
         );
         return rows.map((r) => ({
           id: r.id, partyType: r.party_type, name: r.name, phone: r.phone, email: r.email, gstin: r.gstin,
@@ -316,7 +316,7 @@ export function partyResolvers() {
              UNION ALL
              SELECT f.id::text, 'FARMER', f.name, f.phone, f.email, NULL, COALESCE(f.village, f.district),
                COALESCE((SELECT SUM(total_amount-amount_paid) FROM party_sales WHERE farmer_id=f.id),0)
-                 + COALESCE((SELECT SUM(total_amount-amount_paid) FROM invoices WHERE farmer_id=f.id),0)
+                 + COALESCE((SELECT SUM(total_amount-amount_paid) FROM invoices WHERE farmer_id=f.id AND status <> 'CANCELLED'),0)
              FROM farmers f
            ),
            positive AS (SELECT * FROM recv WHERE balance > 0),
@@ -460,17 +460,21 @@ export function partyResolvers() {
 
           let subTotal = 0, taxTotal = 0;
           const prepared = [];
+          const ids = [...new Set(input.lines.map((l) => l.productId))];
+          const byId = new Map((await client.query('SELECT id, name, gst_percent, packing_size FROM products WHERE id = ANY($1::uuid[])', [ids])).rows.map((p) => [p.id, p]));
           for (const l of input.lines) {
-            const p = (await client.query('SELECT name, gst_percent FROM products WHERE id=$1', [l.productId])).rows[0];
+            const p = byId.get(l.productId);
             if (!p) throw httpError('Product not found', 404);
+            if (!(l.quantity > 0)) throw httpError(`Quantity for ${p.name} must be greater than 0`, 400);
+            if (!(l.unitPrice >= 0)) throw httpError(`Price for ${p.name} cannot be negative`, 400);
             const lineTotal = round2(l.quantity * l.unitPrice);
             const gst = num(p.gst_percent ?? 0);
             subTotal += lineTotal; taxTotal += round2(lineTotal * gst / 100);
-            prepared.push({ l, name: p.name, gst, lineTotal });
+            prepared.push({ l, name: p.name, pack: p.packing_size ?? null, gst, lineTotal });
           }
           subTotal = round2(subTotal); taxTotal = round2(taxTotal);
           const total = round2(subTotal + taxTotal);
-          const paid = Math.min(round2(input.amountPaid ?? 0), total);
+          const paid = Math.min(Math.max(round2(input.amountPaid ?? 0), 0), total);
 
           // FIFO stock-out per line (prefer named batch, else by expiry) with negative-stock prevention.
           const saleNo = `PS-${fy()}-${String((await client.query("SELECT nextval('psale_seq') n")).rows[0].n).padStart(5, '0')}`;
@@ -481,16 +485,16 @@ export function partyResolvers() {
               input.warehouseId, subTotal, taxTotal, total, paid, input.paymentMethod ?? null, input.notes ?? null, a.sub],
           )).rows[0];
 
-          for (const { l, name, gst, lineTotal } of prepared) {
+          for (const { l, name, pack, gst, lineTotal } of prepared) {
             let remaining = l.quantity;
             const stock = (await client.query(
               `SELECT sl.*, b.batch_number FROM stock_levels sl JOIN batches b ON b.id = sl.batch_id
                WHERE sl.product_id=$1 AND sl.warehouse_id=$2 AND sl.quantity>0
                ORDER BY (b.batch_number = $3) DESC, b.expiry_date ASC NULLS LAST FOR UPDATE`,
-              [l.productId, input.warehouseId, l.batchNumber ?? ''],
+              [l.productId, input.warehouseId, l.batchNumber?.trim() ?? ''],
             )).rows;
             const avail = stock.reduce((s, r) => s + num(r.quantity), 0);
-            if (avail < remaining) throw httpError(`Insufficient stock for ${name}: need ${remaining}, have ${avail}`, 400);
+            if (avail < remaining) throw httpError(`Insufficient stock for ${name} in this warehouse: need ${remaining}, have ${avail}`, 400);
             for (const sl of stock) {
               if (remaining <= 0) break;
               const take = Math.min(num(sl.quantity), remaining);
@@ -503,9 +507,9 @@ export function partyResolvers() {
               remaining -= take;
             }
             await client.query(
-              `INSERT INTO party_sale_lines (sale_id, product_id, product_name, batch_number, quantity, unit_price, gst_percent, line_total)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-              [sale.id, l.productId, name, l.batchNumber ?? null, l.quantity, l.unitPrice, gst, lineTotal],
+              `INSERT INTO party_sale_lines (sale_id, product_id, product_name, packing_size, batch_number, quantity, unit_price, gst_percent, line_total)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+              [sale.id, l.productId, name, pack, l.batchNumber || null, l.quantity, l.unitPrice, gst, lineTotal],
             );
           }
           // Auto-generate a CRM lead when a farmer buys — a fresh upsell/follow-up
@@ -536,7 +540,7 @@ export function partyResolvers() {
       itemCount: async (parent) => (await query('SELECT COUNT(*)::int n FROM party_sale_lines WHERE sale_id=$1', [parent.id])).rows[0].n,
       lines: async (parent) => {
         const { rows } = await query('SELECT * FROM party_sale_lines WHERE sale_id=$1 ORDER BY product_name', [parent.id]);
-        return rows.map((r) => ({ id: r.id, productId: r.product_id, productName: r.product_name, batchNumber: r.batch_number, quantity: num(r.quantity), unitPrice: num(r.unit_price), gstPercent: num(r.gst_percent), lineTotal: num(r.line_total) }));
+        return rows.map((r) => ({ id: r.id, productId: r.product_id, productName: r.product_name, packingSize: r.packing_size ?? null, batchNumber: r.batch_number, quantity: num(r.quantity), unitPrice: num(r.unit_price), gstPercent: num(r.gst_percent), lineTotal: num(r.line_total) }));
       },
     },
   };

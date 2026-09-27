@@ -35,7 +35,7 @@ export const enquiryTypeDefs = /* GraphQL */ `
     distributor: DistributorLite
     createdAt: DateTime!
   }
-  type EnquiryStats { total: Int!, newCount: Int!, contacted: Int!, suggestionEnabled: Boolean! }
+  type EnquiryStats { total: Int!, newCount: Int!, contacted: Int!, converted: Int!, suggestionEnabled: Boolean! }
   type EnquiryResult { enquiry: PurchaseEnquiry!, suggestionEnabled: Boolean!, distributor: DistributorLite }
 
   extend type Query {
@@ -55,6 +55,8 @@ export const enquiryTypeDefs = /* GraphQL */ `
     deleteEnquiry(id: ID!): Boolean!
   }
 `;
+
+const ENQ_STATUSES = ['NEW', 'CONTACTED', 'CONVERTED', 'CLOSED'];
 
 function farmerId(ctx) {
   const u = assertAuth(ctx);
@@ -134,18 +136,23 @@ export function enquiryResolvers() {
       },
       purchaseEnquiries: async (_p, { status, limit }, ctx) => {
         assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
-        const { rows } = await query(`${ENQ_SELECT} WHERE ($1::text IS NULL OR e.status=$1) ORDER BY e.created_at DESC LIMIT $2`, [status ?? null, limit]);
+        const st = status?.trim() || null; // "" = all
+        if (st && !ENQ_STATUSES.includes(st)) throw httpError(`Status must be one of ${ENQ_STATUSES.join(', ')}`, 400);
+        const { rows } = await query(`${ENQ_SELECT} WHERE ($1::text IS NULL OR e.status=$1) ORDER BY e.created_at DESC LIMIT $2`, [st, Math.min(Math.max(limit ?? 200, 1), 500)]);
         return rows.map(mapEnquiry);
       },
       enquiryStats: async (_p, _a, ctx) => {
         assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
         const { rows } = await query(
-          `SELECT (SELECT COUNT(*) FROM purchase_enquiries)::int total,
-                  (SELECT COUNT(*) FROM purchase_enquiries WHERE status='NEW')::int new_count,
-                  (SELECT COUNT(*) FROM purchase_enquiries WHERE status='CONTACTED')::int contacted,
-                  (SELECT distributor_suggestion FROM company_settings WHERE id=1) suggestion`,
+          `SELECT COUNT(*)::int total,
+                  COUNT(*) FILTER (WHERE status='NEW')::int new_count,
+                  COUNT(*) FILTER (WHERE status='CONTACTED')::int contacted,
+                  COUNT(*) FILTER (WHERE status='CONVERTED')::int converted,
+                  (SELECT distributor_suggestion FROM company_settings WHERE id=1) suggestion
+           FROM purchase_enquiries`,
         );
-        return { total: rows[0].total, newCount: rows[0].new_count, contacted: rows[0].contacted, suggestionEnabled: rows[0].suggestion ?? true };
+        const r = rows[0];
+        return { total: r.total, newCount: r.new_count, contacted: r.contacted, converted: r.converted, suggestionEnabled: r.suggestion ?? true };
       },
     },
 
@@ -188,8 +195,8 @@ export function enquiryResolvers() {
 
       updateEnquiryStatus: async (_p, { id, status, note }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
-        if (!['NEW', 'CONTACTED', 'CONVERTED', 'CLOSED'].includes(status)) throw httpError('Invalid status', 400);
-        const { rows } = await query('UPDATE purchase_enquiries SET status=$2, note=COALESCE($3,note), updated_at=now() WHERE id=$1 RETURNING id', [id, status, note ?? null]);
+        if (!ENQ_STATUSES.includes(status)) throw httpError(`Status must be one of ${ENQ_STATUSES.join(', ')}`, 400);
+        const { rows } = await query('UPDATE purchase_enquiries SET status=$2, note=COALESCE($3,note), updated_at=now() WHERE id=$1 RETURNING id', [id, status, note?.trim() || null]);
         if (!rows[0]) throw httpError('Enquiry not found', 404);
         await logActivity(a.sub, 'UPDATE_ENQUIRY', 'purchase_enquiry', id, { status });
         return mapEnquiry((await query(`${ENQ_SELECT} WHERE e.id=$1`, [id])).rows[0]);
@@ -210,7 +217,7 @@ export function enquiryResolvers() {
           )).rows[0];
           if (d?.km != null) distanceKm = Math.round(num(d.km) * 10) / 10;
         }
-        const { rows } = await query('UPDATE purchase_enquiries SET distributor_id=$2, distance_km=$3, updated_at=now() WHERE id=$1 RETURNING id', [id, distributorId ?? null, distanceKm]);
+        const { rows } = await query('UPDATE purchase_enquiries SET distributor_id=$2, distance_km=$3, updated_at=now() WHERE id=$1 RETURNING id', [id, distributorId || null, distanceKm]);
         if (!rows[0]) throw httpError('Enquiry not found', 404);
         await logActivity(a.sub, 'ASSIGN_ENQUIRY_DISTRIBUTOR', 'purchase_enquiry', id, { distributorId });
         return mapEnquiry((await query(`${ENQ_SELECT} WHERE e.id=$1`, [id])).rows[0]);

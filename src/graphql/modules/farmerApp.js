@@ -48,7 +48,7 @@ export const farmerAppTypeDefs = /* GraphQL */ `
   type AppComplaint { id: ID!, ticketNo: String!, category: String!, description: String!, status: String!, priority: String, resolutionNote: String, createdAt: DateTime!, events: [AppComplaintEvent!]! }
   type AccountSummary { totalPurchased: Float!, totalPaid: Float!, balance: Float! }
   type AppOrder { id: ID!, orderNo: String!, billType: String!, status: String!, orderDate: String!, totalAmount: Float!, itemCount: Int! }
-  type AppPurchaseLine { productName: String!, quantity: Float!, unitPrice: Float!, lineTotal: Float!, uom: String }
+  type AppPurchaseLine { productName: String!, quantity: Float!, unitPrice: Float!, lineTotal: Float!, uom: String, packingSize: String }
   type AppPurchase {
     id: ID!
     refNo: String!
@@ -118,6 +118,13 @@ async function productNames(ids) {
   return rows.map((r) => r.name);
 }
 
+// One lookup for every row's product_ids (avoids a products query per advisory/diagnosis).
+async function productNamesFor(rows) {
+  const ids = [...new Set(rows.flatMap((r) => r.product_ids ?? []))];
+  const byId = new Map(ids.length ? (await query('SELECT id, name FROM products WHERE id = ANY($1)', [ids])).rows.map((p) => [p.id, p.name]) : []);
+  return (r) => (r.product_ids ?? []).map((pid) => byId.get(pid)).filter(Boolean);
+}
+
 // Best-effort product match for an app diagnosis: trained class → catalog targets → recent.
 async function matchProductsForApp(crop, disease) {
   const trained = (await query(
@@ -157,10 +164,11 @@ export function farmerAppResolvers(app) {
         const id = farmerId(ctx);
         // Farmer-specific advisories + broadcast advisories (no specific farmer).
         const { rows } = await query("SELECT * FROM advisories WHERE (farmer_id = $1 OR farmer_id IS NULL) AND status IN ('SENT','READ') ORDER BY created_at DESC", [id]);
-        return Promise.all(rows.map(async (r) => ({
+        const names = await productNamesFor(rows);
+        return rows.map((r) => ({
           id: r.id, advisoryNo: r.advisory_no, crop: r.crop, disease: r.disease, type: r.type, title: r.title,
-          body: r.body, status: r.status, products: await productNames(r.product_ids), createdAt: r.created_at,
-        })));
+          body: r.body, status: r.status, products: names(r), createdAt: r.created_at,
+        }));
       },
       myComplaints: async (_p, _a, ctx) => {
         const id = farmerId(ctx);
@@ -195,29 +203,41 @@ export function farmerAppResolvers(app) {
       myPurchases: async (_p, _a, ctx) => {
         const id = farmerId(ctx);
         const round2 = (n) => Math.round(n * 100) / 100;
-        const mapLine = (l) => ({ productName: l.product_name, quantity: num(l.quantity), unitPrice: num(l.unit_price), lineTotal: num(l.line_total), uom: l.uom ?? null });
+        const mapLine = (l) => ({ productName: l.product_name, quantity: num(l.quantity), unitPrice: num(l.unit_price), lineTotal: num(l.line_total), uom: l.uom ?? null, packingSize: l.packing_size ?? null });
         const out = [];
 
-        const orders = (await query(
-          `SELECT o.id, o.order_no, o.order_date, o.status, o.total_amount,
-                  COALESCE((SELECT SUM(amount_paid) FROM invoices i WHERE i.order_id = o.id), 0) paid
-           FROM orders o WHERE o.farmer_id = $1 ORDER BY o.created_at DESC`,
-          [id],
-        )).rows;
-        for (const o of orders) {
-          const lines = (await query('SELECT product_name, quantity, unit_price, line_total, uom FROM order_lines WHERE order_id = $1', [o.id])).rows;
-          const total = num(o.total_amount), paid = num(o.paid);
-          out.push({ id: o.id, refNo: o.order_no, kind: 'ORDER', date: isoDate(o.order_date), status: o.status, totalAmount: total, amountPaid: paid, balanceDue: round2(total - paid), items: lines.map(mapLine) });
-        }
+        // Headers + all their lines in 4 parallel queries (was one lines query per document).
+        const [orders, orderLines, sales, saleLines] = (await Promise.all([
+          query(
+            `SELECT o.id, o.order_no, o.order_date, o.status, o.total_amount,
+                    COALESCE((SELECT SUM(amount_paid) FROM invoices i WHERE i.order_id = o.id), 0) paid
+             FROM orders o WHERE o.farmer_id = $1 ORDER BY o.created_at DESC`,
+            [id],
+          ),
+          query(
+            `SELECT l.order_id parent_id, l.product_name, l.quantity, l.unit_price, l.line_total, l.uom, l.packing_size
+             FROM order_lines l JOIN orders o ON o.id = l.order_id WHERE o.farmer_id = $1`,
+            [id],
+          ),
+          query('SELECT id, sale_no, sale_date, total_amount, amount_paid FROM party_sales WHERE farmer_id = $1 ORDER BY created_at DESC', [id]),
+          query(
+            `SELECT l.sale_id parent_id, l.product_name, l.quantity, l.unit_price, l.line_total, p.uom,
+                    COALESCE(l.packing_size, p.packing_size) packing_size
+             FROM party_sale_lines l JOIN party_sales s ON s.id = l.sale_id LEFT JOIN products p ON p.id = l.product_id
+             WHERE s.farmer_id = $1`,
+            [id],
+          ),
+        ])).map((r) => r.rows);
+        const group = (lines) => lines.reduce((m, l) => m.set(l.parent_id, [...(m.get(l.parent_id) ?? []), mapLine(l)]), new Map());
+        const oLines = group(orderLines), sLines = group(saleLines);
 
-        const sales = (await query(
-          'SELECT id, sale_no, sale_date, total_amount, amount_paid FROM party_sales WHERE farmer_id = $1 ORDER BY created_at DESC',
-          [id],
-        )).rows;
+        for (const o of orders) {
+          const total = num(o.total_amount), paid = num(o.paid);
+          out.push({ id: o.id, refNo: o.order_no, kind: 'ORDER', date: isoDate(o.order_date), status: o.status, totalAmount: total, amountPaid: paid, balanceDue: round2(total - paid), items: oLines.get(o.id) ?? [] });
+        }
         for (const s of sales) {
-          const lines = (await query('SELECT product_name, quantity, unit_price, line_total FROM party_sale_lines WHERE sale_id = $1', [s.id])).rows;
           const total = num(s.total_amount), paid = num(s.amount_paid);
-          out.push({ id: s.id, refNo: s.sale_no, kind: 'DIRECT', date: isoDate(s.sale_date), status: paid >= total ? 'PAID' : (paid > 0 ? 'PARTIAL' : 'DUE'), totalAmount: total, amountPaid: paid, balanceDue: round2(total - paid), items: lines.map(mapLine) });
+          out.push({ id: s.id, refNo: s.sale_no, kind: 'DIRECT', date: isoDate(s.sale_date), status: paid >= total ? 'PAID' : (paid > 0 ? 'PARTIAL' : 'DUE'), totalAmount: total, amountPaid: paid, balanceDue: round2(total - paid), items: sLines.get(s.id) ?? [] });
         }
 
         out.sort((a, b) => String(b.date).localeCompare(String(a.date)));
@@ -226,11 +246,12 @@ export function farmerAppResolvers(app) {
       myDiagnoses: async (_p, _a, ctx) => {
         const id = farmerId(ctx);
         const { rows } = await query('SELECT * FROM crop_diagnoses WHERE farmer_id = $1 ORDER BY created_at DESC LIMIT 50', [id]);
-        return Promise.all(rows.map(async (r) => ({
+        const names = await productNamesFor(rows);
+        return rows.map((r) => ({
           id: r.id, sessionNo: r.session_no, crop: r.crop, detectedDisease: r.detected_disease, pathogen: r.pathogen,
           confidence: num(r.confidence), severity: r.severity, symptoms: r.symptoms, recommendation: r.recommendation,
-          source: r.source, products: await productNames(r.product_ids), imageUrl: r.image_url, createdAt: r.created_at,
-        })));
+          source: r.source, products: names(r), imageUrl: r.image_url, createdAt: r.created_at,
+        }));
       },
       myNotifications: async (_p, { limit }, ctx) => {
         const id = farmerId(ctx);
@@ -389,12 +410,15 @@ export function farmerAppResolvers(app) {
 
       raiseComplaint: async (_p, { input }, ctx) => {
         const id = farmerId(ctx);
-        const ticketNo = `CMP-${String((await query("SELECT nextval('complaint_seq') n")).rows[0].n).padStart(5, '0')}`;
+        if (!input.category?.trim()) throw httpError('Complaint category is required', 400);
+        const ticketNo = `CMP-${String((await query("SELECT nextval('complaint_seq') n")).rows[0].n).padStart(6, '0')}`;
+        // Same priority scale as the admin panel (LOW / NORMAL / HIGH).
         const { rows } = await query(
           `INSERT INTO complaints (ticket_no, farmer_id, category, description, status, priority)
-           VALUES ($1,$2,$3,$4,'OPEN','MEDIUM') RETURNING *`,
-          [ticketNo, id, input.category, input.description],
+           VALUES ($1,$2,$3,$4,'OPEN','NORMAL') RETURNING *`,
+          [ticketNo, id, input.category.trim(), input.description],
         );
+        await query("INSERT INTO complaint_events (complaint_id, event_type, detail) VALUES ($1,'CREATED',$2)", [rows[0].id, `Complaint ${ticketNo} raised from the Farmer App`]);
         await logActivity(null, 'RAISE_COMPLAINT', 'complaint', rows[0].id, { ticketNo, via: 'farmer-app' });
         const r = rows[0];
         return { id: r.id, ticketNo: r.ticket_no, category: r.category, description: r.description, status: r.status, priority: r.priority, resolutionNote: r.resolution_note, createdAt: r.created_at };

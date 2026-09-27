@@ -5,7 +5,7 @@
 import { query } from '../../db/index.js';
 import { assertAuth, assertRole } from '../context.js';
 import { httpError, logActivity, num, isoDate } from '../helpers.js';
-import { diagnoseCrop, generateAdvisory as genAdvisory, aiChannelStatus, embedSample, cosineSim } from '../../services/ai/index.js';
+import { diagnoseCrop, generateAdvisory as genAdvisory, aiChannelStatus, embedSample, cosineSim, labelFits } from '../../services/ai/index.js';
 import { upsertSample, deleteSamples, querySimilar, vectorStoreStatus, pineconeConfigured } from '../../services/ai/pinecone.js';
 import { sendEmail } from '../../services/notify/email.js';
 import { sendPush } from '../../services/notify/push.js';
@@ -137,7 +137,7 @@ export const aiTypeDefs = /* GraphQL */ `
   }
 
   input UpdateLeadInput { crop: String, disease: String, status: String, notes: String }
-  input RunDiagnosisInput { farmerId: ID, crop: String!, imageUrl: String, gpsLat: Float, gpsLng: Float }
+  input RunDiagnosisInput { farmerId: ID, crop: String!, imageUrl: String, symptoms: String, gpsLat: Float, gpsLng: Float }
   input GenerateAdvisoryInput { diagnosisId: ID, farmerId: ID, crop: String!, disease: String, type: String = "CURATIVE" }
   input UpdateAdvisoryInput { crop: String!, disease: String, type: String!, title: String!, body: String!, farmerId: ID }
 
@@ -181,26 +181,37 @@ export const MAX_SAMPLES_PER_CLASS = 20;
 const mapDiag = (r) => r && {
   id: r.id, sessionNo: r.session_no, farmerId: r.farmer_id, farmerName: r.farmer_name ?? null, crop: r.crop,
   imageUrl: r.image_url, detectedDisease: r.detected_disease, pathogen: r.pathogen, confidence: num(r.confidence),
-  severity: r.severity, symptoms: r.symptoms, recommendation: r.recommendation, productIds: r.product_ids ?? [],
-  source: r.source, gpsLat: num(r.gps_lat), gpsLng: num(r.gps_lng), createdAt: r.created_at,
+  severity: r.severity, symptoms: r.symptoms, recommendation: r.recommendation, productIds: r.product_ids ?? [], products: r.products,
+  source: r.source, gpsLat: num(r.gps_lat), gpsLng: num(r.gps_lng), hasLead: r.has_lead, createdAt: r.created_at,
 };
 const mapAdvisory = (r) => r && {
   id: r.id, advisoryNo: r.advisory_no, diagnosisId: r.diagnosis_id, farmerId: r.farmer_id, farmerName: r.farmer_name ?? null,
-  crop: r.crop, disease: r.disease, type: r.type, title: r.title, body: r.body, productIds: r.product_ids ?? [],
+  crop: r.crop, disease: r.disease, type: r.type, title: r.title, body: r.body, productIds: r.product_ids ?? [], products: r.products,
   status: r.status, source: r.source, createdAt: r.created_at, sentAt: r.sent_at,
 };
 const mapLead = (r) => r && {
   id: r.id, leadNo: r.lead_no, diagnosisId: r.diagnosis_id, farmerId: r.farmer_id, farmerName: r.farmer_name ?? null,
-  farmerPhone: r.farmer_phone ?? null, crop: r.crop, disease: r.disease, productIds: r.product_ids ?? [],
+  farmerPhone: r.farmer_phone ?? null, crop: r.crop, disease: r.disease, productIds: r.product_ids ?? [], products: r.products,
   priorPurchase: r.prior_purchase, assignedTo: r.assigned_to, assignedName: r.assigned_name ?? null,
   status: r.status, notes: r.notes, createdAt: r.created_at,
 };
 
 const mapClass = (r) => r && {
   id: r.id, classNo: r.class_no, crop: r.crop, disease: r.disease, pathogen: r.pathogen,
-  description: r.description, symptoms: r.symptoms, treatment: r.treatment, productIds: r.product_ids ?? [],
-  isActive: r.is_active, createdAt: r.created_at,
+  description: r.description, symptoms: r.symptoms, treatment: r.treatment, productIds: r.product_ids ?? [], products: r.products,
+  sampleCount: r.sample_count, isActive: r.is_active, createdAt: r.created_at,
 };
+
+// Batched product refs for list queries (avoids one products query per row). `x` = row alias.
+const PRODUCTS_JSON = (x) => `(SELECT COALESCE(json_agg(json_build_object('id', p.id, 'name', p.name) ORDER BY p.name), '[]'::json)
+  FROM products p WHERE p.id = ANY(${x}.product_ids)) AS products`;
+const DIAG_SELECT = `SELECT d.*, f.name farmer_name, ${PRODUCTS_JSON('d')},
+  EXISTS (SELECT 1 FROM crm_leads l WHERE l.diagnosis_id = d.id) AS has_lead
+  FROM crop_diagnoses d LEFT JOIN farmers f ON f.id = d.farmer_id`;
+const ADV_SELECT = `SELECT a.*, f.name farmer_name, ${PRODUCTS_JSON('a')} FROM advisories a LEFT JOIN farmers f ON f.id = a.farmer_id`;
+const LEAD_SELECT = `SELECT l.*, f.name farmer_name, f.phone farmer_phone, u.name assigned_name, ${PRODUCTS_JSON('l')}
+  FROM crm_leads l LEFT JOIN farmers f ON f.id = l.farmer_id LEFT JOIN users u ON u.id = l.assigned_to`;
+const blank = (v) => (typeof v === 'string' ? v.trim() || null : v ?? null);
 
 // Retrieval-augmented reference selection (RAG): rank the trained photos for a
 // crop by visual-embedding similarity to the farmer's photo and return the most
@@ -209,6 +220,16 @@ const mapClass = (r) => r && {
 //   2. Postgres + in-memory cosine over cached Gemini embeddings
 //   3. Most-recent labelled examples (still grounds the model, just not ranked)
 export async function getTrainingReferences(crop, queryImageUrl) {
+  // Postgres holds every trained sample (Pinecone mirrors it), so no rows = nothing to
+  // retrieve: skip the caption + embedding round-trips entirely.
+  const { rows } = await query(
+    `SELECT s.id, s.image_url, s.vision_caption, s.embedding, c.disease, c.pathogen
+     FROM ai_training_samples s JOIN ai_training_classes c ON c.id = s.class_id
+     WHERE c.is_active AND c.crop ILIKE $1 ORDER BY s.created_at DESC`,
+    [crop],
+  );
+  if (!rows.length) return { references: [], retrieval: 'none', topScore: 0 };
+
   // Embed the farmer's photo once; reused by both the Pinecone and in-memory paths.
   const q = queryImageUrl ? await embedSample(queryImageUrl, crop, crop) : null;
 
@@ -218,8 +239,6 @@ export async function getTrainingReferences(crop, queryImageUrl) {
     if (matches?.length) {
       // Pinecone holds lightweight metadata; resolve the image URLs from Postgres
       // (data: URLs are too large for vector metadata) preserving the ranked order.
-      const ids = matches.map((m) => m.id);
-      const { rows } = await query('SELECT id, image_url, vision_caption FROM ai_training_samples WHERE id = ANY($1)', [ids]);
       const byId = new Map(rows.map((r) => [r.id, r]));
       const references = matches.map((m) => {
         const r = byId.get(m.id);
@@ -231,14 +250,6 @@ export async function getTrainingReferences(crop, queryImageUrl) {
   }
 
   // ── 2) / 3) Postgres-backed fallback ───────────────────────────────────────
-  const { rows } = await query(
-    `SELECT s.image_url, s.vision_caption, s.embedding, c.disease, c.pathogen
-     FROM ai_training_samples s JOIN ai_training_classes c ON c.id = s.class_id
-     WHERE c.is_active AND c.crop ILIKE $1`,
-    [crop],
-  );
-  if (!rows.length) return { references: [], retrieval: 'none', topScore: 0 };
-
   const embedded = rows.filter((r) => Array.isArray(r.embedding) && r.embedding.length);
   if (q?.vector && embedded.length) {
     const ranked = embedded
@@ -269,28 +280,36 @@ async function indexSample(sampleId, imageUrl, cls) {
   return true;
 }
 
-// A trained class matching the detected crop+disease (drives curated product recommendations).
-async function matchedTrainedClass(crop, disease) {
-  if (!disease) return null;
+// Company products to recommend, best source first:
+//   1. a trained class for this crop+disease (curated by the agronomy team)
+//   2. Product Master label targets matching the disease + the AI's catalog picks
+//   3. products labelled for the crop (only when nothing disease-specific matched)
+// Returns product ids (max 5). Nothing fits, or nothing to treat → [] (never a random / off-label product).
+async function recommendProducts(crop, disease, aiIds = []) {
+  const d = blank(disease) ?? '';
+  if (/^(healthy|unclear)/i.test(d)) return [];
+  if (d) {
+    const trained = (await query(
+      `SELECT product_ids FROM ai_training_classes WHERE is_active AND crop ILIKE $1 AND disease ILIKE '%'||$2||'%' AND cardinality(product_ids) > 0 LIMIT 1`,
+      [crop, d],
+    )).rows[0];
+    if (trained) return trained.product_ids.slice(0, 5);
+  }
   const { rows } = await query(
-    `SELECT product_ids FROM ai_training_classes WHERE is_active AND crop ILIKE $1 AND disease ILIKE '%'||$2||'%' LIMIT 1`,
-    [crop, disease],
+    `SELECT DISTINCT ON (lower(name)) id, name, target_crops,
+       ($1 <> '' AND EXISTS (SELECT 1 FROM unnest(target_diseases) td WHERE td <> '' AND (td ILIKE '%'||$1||'%' OR $1 ILIKE '%'||td||'%'))) AS disease_fit,
+       id = ANY($3::uuid[]) AS ai_pick
+     FROM products
+     WHERE is_active AND (
+       ($1 <> '' AND EXISTS (SELECT 1 FROM unnest(target_diseases) td WHERE td <> '' AND (td ILIKE '%'||$1||'%' OR $1 ILIKE '%'||td||'%')))
+       OR id = ANY($3::uuid[])
+       OR ($2 <> '' AND EXISTS (SELECT 1 FROM unnest(target_crops) tc WHERE tc ILIKE $2))
+     ) ORDER BY lower(name), created_at`,
+    [d, crop ?? '', aiIds],
   );
-  return rows[0] ?? null;
-}
-
-// Match company products to a disease/crop via the Product Master's target arrays.
-async function matchProducts(disease, crop) {
-  const { rows } = await query(
-    `SELECT id, name FROM products WHERE is_active AND (
-       ($1 <> '' AND EXISTS (SELECT 1 FROM unnest(target_diseases) td WHERE td ILIKE '%'||$1||'%'))
-       OR ($2 <> '' AND EXISTS (SELECT 1 FROM unnest(target_crops) tc WHERE tc ILIKE '%'||$2||'%'))
-     ) ORDER BY name LIMIT 5`,
-    [disease || '', crop || ''],
-  );
-  if (rows.length) return rows;
-  // Fallback so there is always something to recommend / sell.
-  return (await query('SELECT id, name FROM products WHERE is_active ORDER BY created_at DESC LIMIT 3')).rows;
+  const onLabel = rows.filter((r) => labelFits(r.target_crops, crop));
+  const specific = onLabel.filter((r) => r.disease_fit || r.ai_pick).sort((x, y) => Number(y.disease_fit) - Number(x.disease_fit));
+  return (specific.length ? specific : onLabel).slice(0, 5).map((r) => r.id);
 }
 
 const seq = async (name) => (await query(`SELECT nextval('${name}') n`)).rows[0].n;
@@ -302,13 +321,11 @@ export function aiResolvers() {
         assertAuth(ctx);
         const offset = (page - 1) * pageSize;
         const sevFilter = severity && severity !== 'ALL' ? severity : null;
-        const searchTerm = search ?? null;
+        const searchTerm = blank(search);
 
         const [dataRes, countRes] = await Promise.all([
           query(
-            `SELECT d.*, f.name farmer_name
-             FROM crop_diagnoses d
-             LEFT JOIN farmers f ON f.id = d.farmer_id
+            `${DIAG_SELECT}
              WHERE ($1::text IS NULL
                     OR d.crop ILIKE '%'||$1||'%'
                     OR d.detected_disease ILIKE '%'||$1||'%'
@@ -358,25 +375,22 @@ export function aiResolvers() {
       },
       cropDiagnosis: async (_p, { id }, ctx) => {
         assertAuth(ctx);
-        const { rows } = await query('SELECT d.*, f.name farmer_name FROM crop_diagnoses d LEFT JOIN farmers f ON f.id=d.farmer_id WHERE d.id=$1', [id]);
+        const { rows } = await query(`${DIAG_SELECT} WHERE d.id=$1`, [id]);
         return mapDiag(rows[0]);
       },
       advisories: async (_p, { status, limit }, ctx) => {
         assertAuth(ctx);
         const { rows } = await query(
-          `SELECT a.*, f.name farmer_name FROM advisories a LEFT JOIN farmers f ON f.id = a.farmer_id
-           WHERE ($1::text IS NULL OR a.status=$1) ORDER BY a.created_at DESC LIMIT $2`,
-          [status ?? null, limit],
+          `${ADV_SELECT} WHERE ($1::text IS NULL OR a.status=$1) ORDER BY a.created_at DESC LIMIT $2`,
+          [blank(status), Math.min(limit ?? 100, 1000)],
         );
         return rows.map(mapAdvisory);
       },
       crmLeads: async (_p, { status, limit }, ctx) => {
         assertAuth(ctx);
         const { rows } = await query(
-          `SELECT l.*, f.name farmer_name, f.phone farmer_phone, u.name assigned_name
-           FROM crm_leads l LEFT JOIN farmers f ON f.id = l.farmer_id LEFT JOIN users u ON u.id = l.assigned_to
-           WHERE ($1::text IS NULL OR l.status=$1) ORDER BY l.created_at DESC LIMIT $2`,
-          [status ?? null, limit],
+          `${LEAD_SELECT} WHERE ($1::text IS NULL OR l.status=$1) ORDER BY l.created_at DESC LIMIT $2`,
+          [blank(status), Math.min(limit ?? 100, 1000)],
         );
         return rows.map(mapLead);
       },
@@ -442,11 +456,12 @@ export function aiResolvers() {
       trainingClasses: async (_p, { search, crop }, ctx) => {
         assertAuth(ctx);
         const { rows } = await query(
-          `SELECT * FROM ai_training_classes
-           WHERE ($1::text IS NULL OR disease ILIKE '%'||$1||'%' OR crop ILIKE '%'||$1||'%' OR class_no ILIKE '%'||$1||'%')
-             AND ($2::text IS NULL OR crop ILIKE $2)
-           ORDER BY created_at DESC`,
-          [search ?? null, crop ?? null],
+          `SELECT c.*, (SELECT COUNT(*) FROM ai_training_samples s WHERE s.class_id = c.id)::int sample_count
+           FROM ai_training_classes c
+           WHERE ($1::text IS NULL OR c.disease ILIKE '%'||$1||'%' OR c.crop ILIKE '%'||$1||'%' OR c.class_no ILIKE '%'||$1||'%' OR c.pathogen ILIKE '%'||$1||'%')
+             AND ($2::text IS NULL OR c.crop ILIKE $2)
+           ORDER BY c.created_at DESC`,
+          [blank(search), blank(crop)],
         );
         return rows.map(mapClass);
       },
@@ -462,7 +477,7 @@ export function aiResolvers() {
            ) x
            WHERE d IS NOT NULL AND btrim(d) <> '' AND ($1::text IS NULL OR x.crop IS NULL OR x.crop ILIKE $1)
            ORDER BY d`,
-          [crop ?? null],
+          [blank(crop)],
         );
         return rows.map((r) => r.d);
       },
@@ -474,7 +489,7 @@ export function aiResolvers() {
                   (SELECT COUNT(DISTINCT lower(crop)) FROM ai_training_classes WHERE is_active)::int crops`,
         );
         const st = aiChannelStatus();
-        const vs = await vectorStoreStatus();
+        const vs = await vectorStoreStatus(); // cached — Pinecone stats are slow round-trips
         return {
           ...rows[0], aiConfigured: st.configured, model: st.model, embeddingModel: st.embeddingModel,
           vectorStore: {
@@ -488,58 +503,54 @@ export function aiResolvers() {
     Mutation: {
       runCropDiagnosis: async (_p, { input }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
-        const { references } = await getTrainingReferences(input.crop, input.imageUrl); // RAG grounding from Train AI Doctor
-        const d = await diagnoseCrop({ crop: input.crop, imageUrl: input.imageUrl, references });
-        // Prefer a trained class's curated products when the detected disease matches one.
-        let prods = await matchProducts(d.disease, input.crop);
-        const trained = await matchedTrainedClass(input.crop, d.disease);
-        if (trained?.product_ids?.length) {
-          const tp = await productRefs(trained.product_ids);
-          if (tp.length) prods = tp;
-        }
+        const crop = blank(input.crop);
+        if (!crop) throw httpError('Crop is required', 400);
+        const imageUrl = blank(input.imageUrl);
+        const { references } = await getTrainingReferences(crop, imageUrl); // RAG grounding from Train AI Doctor
+        const d = await diagnoseCrop({ crop, imageUrl, references, symptoms: blank(input.symptoms) });
+        const productIds = await recommendProducts(crop, d.disease, d.productIds);
         const sessionNo = `AID-${String(await seq('diag_seq')).padStart(5, '0')}`;
         const { rows } = await query(
           `INSERT INTO crop_diagnoses (session_no, farmer_id, crop, image_url, detected_disease, pathogen, confidence, severity, symptoms, recommendation, product_ids, source, gps_lat, gps_lng, created_by)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
-          [sessionNo, input.farmerId ?? null, input.crop, input.imageUrl ?? null, d.disease, d.pathogen, d.confidence, d.severity, d.symptoms, d.recommendation, prods.map((p) => p.id), d.source, input.gpsLat ?? null, input.gpsLng ?? null, a.sub],
+          [sessionNo, blank(input.farmerId), crop, imageUrl, d.disease, d.pathogen, d.confidence, d.severity, d.symptoms, d.recommendation, productIds, d.source, input.gpsLat ?? null, input.gpsLng ?? null, a.sub],
         );
         await logActivity(a.sub, 'AI_DIAGNOSE', 'crop_diagnosis', rows[0].id, { disease: d.disease, source: d.source });
-        const full = await query('SELECT d.*, f.name farmer_name FROM crop_diagnoses d LEFT JOIN farmers f ON f.id=d.farmer_id WHERE d.id=$1', [rows[0].id]);
+        const full = await query(`${DIAG_SELECT} WHERE d.id=$1`, [rows[0].id]);
         return mapDiag(full.rows[0]);
       },
 
       generateAdvisory: async (_p, { input }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
         const type = input.type === 'PREVENTIVE' ? 'PREVENTIVE' : 'CURATIVE';
-        const adv = await genAdvisory({ crop: input.crop, disease: input.disease, type });
-        // Recommend from the Product Master (target arrays), preferring a trained class's curated products.
-        let prods = await matchProducts(input.disease, input.crop);
-        const trained = await matchedTrainedClass(input.crop, input.disease);
-        if (trained?.product_ids?.length) {
-          const tp = await productRefs(trained.product_ids);
-          if (tp.length) prods = tp;
-        }
+        const crop = blank(input.crop);
+        if (!crop) throw httpError('Crop is required', 400);
+        const disease = blank(input.disease);
+        const adv = await genAdvisory({ crop, disease, type });
+        const productIds = await recommendProducts(crop, disease, adv.productIds);
         const advisoryNo = `ADV-${String(await seq('adv_seq')).padStart(5, '0')}`;
         const { rows } = await query(
           `INSERT INTO advisories (advisory_no, diagnosis_id, farmer_id, crop, disease, type, title, body, product_ids, source, created_by)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-          [advisoryNo, input.diagnosisId ?? null, input.farmerId ?? null, input.crop, input.disease ?? null, type, adv.title, adv.body, prods.map((p) => p.id), adv.source, a.sub],
+          [advisoryNo, blank(input.diagnosisId), blank(input.farmerId), crop, disease, type, adv.title, adv.body, productIds, adv.source, a.sub],
         );
         await logActivity(a.sub, 'AI_ADVISORY', 'advisory', rows[0].id, { type });
-        const full = await query('SELECT a.*, f.name farmer_name FROM advisories a LEFT JOIN farmers f ON f.id=a.farmer_id WHERE a.id=$1', [rows[0].id]);
+        const full = await query(`${ADV_SELECT} WHERE a.id=$1`, [rows[0].id]);
         return mapAdvisory(full.rows[0]);
       },
 
       updateAdvisory: async (_p, { id, input }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
         const type = input.type === 'PREVENTIVE' ? 'PREVENTIVE' : 'CURATIVE';
+        const [crop, title, body] = [blank(input.crop), blank(input.title), blank(input.body)];
+        if (!crop || !title || !body) throw httpError('Crop, title and body are required', 400);
         const { rows } = await query(
           'UPDATE advisories SET crop=$2, disease=$3, type=$4, title=$5, body=$6, farmer_id=$7 WHERE id=$1 RETURNING id',
-          [id, input.crop, input.disease ?? null, type, input.title, input.body, input.farmerId ?? null],
+          [id, crop, blank(input.disease), type, title, body, blank(input.farmerId)],
         );
         if (!rows[0]) throw httpError('Advisory not found', 404);
         await logActivity(a.sub, 'UPDATE_ADVISORY', 'advisory', id);
-        const full = await query('SELECT a.*, f.name farmer_name FROM advisories a LEFT JOIN farmers f ON f.id=a.farmer_id WHERE a.id=$1', [id]);
+        const full = await query(`${ADV_SELECT} WHERE a.id=$1`, [id]);
         return mapAdvisory(full.rows[0]);
       },
       deleteAdvisory: async (_p, { id }, ctx) => {
@@ -573,7 +584,7 @@ export function aiResolvers() {
           [leadNo, diagnosisId, d.farmer_id, d.crop, d.detected_disease, d.product_ids ?? [], prior],
         );
         await logActivity(a.sub, 'CREATE_LEAD', 'crm_lead', rows[0].id, { leadNo });
-        const full = await query('SELECT l.*, f.name farmer_name, f.phone farmer_phone, u.name assigned_name FROM crm_leads l LEFT JOIN farmers f ON f.id=l.farmer_id LEFT JOIN users u ON u.id=l.assigned_to WHERE l.id=$1', [rows[0].id]);
+        const full = await query(`${LEAD_SELECT} WHERE l.id=$1`, [rows[0].id]);
         return mapLead(full.rows[0]);
       },
 
@@ -582,7 +593,7 @@ export function aiResolvers() {
         const { rows } = await query("UPDATE crm_leads SET assigned_to=$2, status=CASE WHEN status='NEW' THEN 'CONTACTED' ELSE status END, updated_at=now() WHERE id=$1 RETURNING id", [id, userId]);
         if (!rows[0]) throw httpError('Lead not found', 404);
         await logActivity(a.sub, 'ASSIGN_LEAD', 'crm_lead', id, { userId });
-        const full = await query('SELECT l.*, f.name farmer_name, f.phone farmer_phone, u.name assigned_name FROM crm_leads l LEFT JOIN farmers f ON f.id=l.farmer_id LEFT JOIN users u ON u.id=l.assigned_to WHERE l.id=$1', [id]);
+        const full = await query(`${LEAD_SELECT} WHERE l.id=$1`, [id]);
         return mapLead(full.rows[0]);
       },
 
@@ -592,7 +603,7 @@ export function aiResolvers() {
         const { rows } = await query('UPDATE crm_leads SET status=$2, notes=COALESCE($3, notes), updated_at=now() WHERE id=$1 RETURNING id', [id, status, notes ?? null]);
         if (!rows[0]) throw httpError('Lead not found', 404);
         await logActivity(a.sub, 'UPDATE_LEAD', 'crm_lead', id, { status });
-        const full = await query('SELECT l.*, f.name farmer_name, f.phone farmer_phone, u.name assigned_name FROM crm_leads l LEFT JOIN farmers f ON f.id=l.farmer_id LEFT JOIN users u ON u.id=l.assigned_to WHERE l.id=$1', [id]);
+        const full = await query(`${LEAD_SELECT} WHERE l.id=$1`, [id]);
         return mapLead(full.rows[0]);
       },
 
@@ -604,11 +615,11 @@ export function aiResolvers() {
           `UPDATE crm_leads SET crop=COALESCE($2, crop), disease=COALESCE($3, disease),
              status=COALESCE($4, status), notes=COALESCE($5, notes), updated_at=now()
            WHERE id=$1 RETURNING id`,
-          [id, input.crop ?? null, input.disease ?? null, input.status ?? null, input.notes ?? null],
+          [id, blank(input.crop), blank(input.disease), blank(input.status), input.notes ?? null],
         );
         if (!rows[0]) throw httpError('Lead not found', 404);
         await logActivity(a.sub, 'UPDATE_LEAD', 'crm_lead', id, {});
-        const full = await query('SELECT l.*, f.name farmer_name, f.phone farmer_phone, u.name assigned_name FROM crm_leads l LEFT JOIN farmers f ON f.id=l.farmer_id LEFT JOIN users u ON u.id=l.assigned_to WHERE l.id=$1', [id]);
+        const full = await query(`${LEAD_SELECT} WHERE l.id=$1`, [id]);
         return mapLead(full.rows[0]);
       },
 
@@ -629,7 +640,7 @@ export function aiResolvers() {
         if (!adv) throw httpError('Advisory not found', 404);
         if (adv.farmer_email) {
           const text = `Dear ${adv.farmer_name ?? 'Farmer'},\n\n${adv.body}\n\nRegards,\nCropland Agritech India`;
-          await sendEmail([adv.farmer_email], adv.title, text);
+          await sendEmail([adv.farmer_email], adv.title, text).catch((e) => console.error('[advisory] email failed:', e.message));
         }
         await query("UPDATE advisories SET status='SENT', sent_at=now() WHERE id=$1", [id]);
         await logActivity(a.sub, 'SEND_ADVISORY', 'advisory', id);
@@ -651,27 +662,30 @@ export function aiResolvers() {
           }
         } catch (_) { /* push failure is non-blocking */ }
 
-        const full = await query('SELECT a.*, f.name farmer_name FROM advisories a LEFT JOIN farmers f ON f.id=a.farmer_id WHERE a.id=$1', [id]);
+        const full = await query(`${ADV_SELECT} WHERE a.id=$1`, [id]);
         return mapAdvisory(full.rows[0]);
       },
 
       // ── Train AI Doctor ──
       createTrainingClass: async (_p, { input }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        if (!blank(input.crop) || !blank(input.disease)) throw httpError('Crop and disease are required', 400);
         const classNo = `AIC-${String(await seq('aiclass_seq')).padStart(4, '0')}`;
         const { rows } = await query(
           `INSERT INTO ai_training_classes (class_no, crop, disease, pathogen, description, symptoms, treatment, product_ids, created_by)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-          [classNo, input.crop, input.disease, input.pathogen ?? null, input.description ?? null, input.symptoms ?? null, input.treatment ?? null, input.productIds ?? [], a.sub],
+          [classNo, blank(input.crop), blank(input.disease), blank(input.pathogen), blank(input.description), blank(input.symptoms), blank(input.treatment), input.productIds ?? [], a.sub],
         );
         await logActivity(a.sub, 'CREATE_TRAINING_CLASS', 'ai_training_class', rows[0].id, { classNo });
         return mapClass(rows[0]);
       },
       updateTrainingClass: async (_p, { id, input }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        if (!blank(input.crop) || !blank(input.disease)) throw httpError('Crop and disease are required', 400);
         const { rows } = await query(
-          `UPDATE ai_training_classes SET crop=$2, disease=$3, pathogen=$4, description=$5, symptoms=$6, treatment=$7, product_ids=$8, updated_at=now() WHERE id=$1 RETURNING *`,
-          [id, input.crop, input.disease, input.pathogen ?? null, input.description ?? null, input.symptoms ?? null, input.treatment ?? null, input.productIds ?? []],
+          // description is kept when the client omits it (the admin form has no description field).
+          `UPDATE ai_training_classes SET crop=$2, disease=$3, pathogen=$4, description=CASE WHEN $9 THEN $5 ELSE description END, symptoms=$6, treatment=$7, product_ids=$8, updated_at=now() WHERE id=$1 RETURNING *`,
+          [id, blank(input.crop), blank(input.disease), blank(input.pathogen), blank(input.description), blank(input.symptoms), blank(input.treatment), input.productIds ?? [], input.description !== undefined],
         );
         if (!rows[0]) throw httpError('Training class not found', 404);
         await logActivity(a.sub, 'UPDATE_TRAINING_CLASS', 'ai_training_class', id);
@@ -689,6 +703,7 @@ export function aiResolvers() {
       },
       addTrainingSample: async (_p, { classId, input }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        if (!blank(input.imageUrl)) throw httpError('Image is required', 400);
         const cls = (await query('SELECT id, crop, disease, pathogen, symptoms FROM ai_training_classes WHERE id=$1', [classId])).rows[0];
         if (!cls) throw httpError('Training class not found', 404);
         const count = Number((await query('SELECT COUNT(*) n FROM ai_training_samples WHERE class_id=$1', [classId])).rows[0].n);
@@ -736,14 +751,14 @@ export function aiResolvers() {
     },
 
     CropDiagnosis: {
-      recommendedProducts: (parent) => productRefs(parent.productIds),
-      hasLead: async (parent) => Boolean((await query('SELECT 1 FROM crm_leads WHERE diagnosis_id=$1', [parent.id])).rows[0]),
+      recommendedProducts: (parent) => parent.products ?? productRefs(parent.productIds),
+      hasLead: async (parent) => parent.hasLead ?? Boolean((await query('SELECT 1 FROM crm_leads WHERE diagnosis_id=$1', [parent.id])).rows[0]),
     },
-    Advisory: { recommendedProducts: (parent) => productRefs(parent.productIds) },
-    CrmLead: { recommendedProducts: (parent) => productRefs(parent.productIds) },
+    Advisory: { recommendedProducts: (parent) => parent.products ?? productRefs(parent.productIds) },
+    CrmLead: { recommendedProducts: (parent) => parent.products ?? productRefs(parent.productIds) },
     AiTrainingClass: {
-      recommendedProducts: (parent) => productRefs(parent.productIds),
-      sampleCount: async (parent) => Number((await query('SELECT COUNT(*) n FROM ai_training_samples WHERE class_id=$1', [parent.id])).rows[0].n),
+      recommendedProducts: (parent) => parent.products ?? productRefs(parent.productIds),
+      sampleCount: async (parent) => parent.sampleCount ?? Number((await query('SELECT COUNT(*) n FROM ai_training_samples WHERE class_id=$1', [parent.id])).rows[0].n),
       samples: async (parent) => {
         const { rows } = await query('SELECT id, image_url, caption, created_at FROM ai_training_samples WHERE class_id=$1 ORDER BY created_at', [parent.id]);
         return rows.map((r) => ({ id: r.id, imageUrl: r.image_url, caption: r.caption, createdAt: r.created_at }));

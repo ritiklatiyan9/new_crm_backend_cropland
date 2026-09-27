@@ -65,10 +65,17 @@ export function validateGstr1Payload(p = {}) {
       for (const it of nt.itms || []) checkItem(it, `CDNR ${nt.nt_num}`, errors, warnings);
     }
   }
-  for (const h of (p.hsn && p.hsn.data) || []) {
-    if (!h.hsn_sc) warnings.push('HSN: a row is missing the HSN/SAC code');
-    if (num(h.txval) < 0) errors.push('HSN: negative taxable value');
+  // Table 12: split B2B / B2C (current), or the legacy single `data` list.
+  const hsn = p.hsn || {};
+  for (const [part, rows] of [['HSN B2B', hsn.hsn_b2b], ['HSN B2C', hsn.hsn_b2c], ['HSN', hsn.data]]) {
+    for (const h of rows || []) {
+      if (!h.hsn_sc) warnings.push(`${part}: a row is missing the HSN/SAC code`);
+      else if (!/^\d{4}(\d{2}(\d{2})?)?$/.test(String(h.hsn_sc))) warnings.push(`${part}: HSN ${h.hsn_sc} should be 4, 6 or 8 digits`);
+      if (num(h.txval) < 0) errors.push(`${part}: negative taxable value`);
+      if (!h.uqc) errors.push(`${part} ${h.hsn_sc}: UQC missing`);
+    }
   }
+  if ((p.b2b || []).length && !(hsn.hsn_b2b || []).length && !(hsn.data || []).length) warnings.push('HSN B2B summary is empty although B2B invoices exist');
   return { valid: errors.length === 0, errors, warnings };
 }
 

@@ -14,6 +14,13 @@ export const pool = new Pool({
   connectionString: env.db.connectionString,
   max: env.db.poolMax,
   ssl: env.db.ssl ? { rejectUnauthorized: false } : false,
+  // Neon suspends idle computes and drops idle sockets; keep the pool small and short-lived.
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 15_000, // covers a Neon cold start without hanging requests forever
+  keepAlive: true,
+  // Awaited before the client is handed out. A SET, not a startup parameter: Neon's pooler rejects startup options.
+  onConnect: (client) =>
+    client.query(`SET statement_timeout = ${Math.trunc(env.db.statementTimeoutMs)}`).catch(() => {}),
 });
 
 pool.on('error', (err) => {
@@ -27,8 +34,17 @@ pool.on('error', (err) => {
  * @param {string} text - SQL with $1..$n placeholders.
  * @param {unknown[]} [params] - bound parameters.
  */
-export function query(text, params) {
-  return pool.query(text, params);
+export async function query(text, params) {
+  const start = performance.now();
+  try {
+    return await pool.query(text, params);
+  } finally {
+    const ms = performance.now() - start;
+    if (ms > env.db.slowQueryMs) {
+      // eslint-disable-next-line no-console
+      console.warn(`[pg] slow query ${Math.round(ms)}ms: ${String(text).replace(/\s+/g, ' ').trim().slice(0, 200)}`);
+    }
+  }
 }
 
 /**
@@ -40,16 +56,21 @@ export function query(text, params) {
  */
 export async function withTransaction(fn) {
   const client = await pool.connect();
+  let broken;
   try {
     await client.query('BEGIN');
     const result = await fn(client);
     await client.query('COMMIT');
     return result;
   } catch (err) {
-    await client.query('ROLLBACK');
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackErr) {
+      broken = rollbackErr; // connection is unusable; destroy it instead of returning it to the pool
+    }
     throw err;
   } finally {
-    client.release();
+    client.release(broken);
   }
 }
 

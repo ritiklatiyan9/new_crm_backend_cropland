@@ -4,6 +4,7 @@
 import { query } from '../../db/index.js';
 import { assertAuth, assertRole } from '../context.js';
 import { httpError, logActivity, num, isoDate } from '../helpers.js';
+import { mapProduct } from './products.js';
 
 export const pricingTypeDefs = /* GraphQL */ `
   type PriceRule {
@@ -68,7 +69,7 @@ export const pricingTypeDefs = /* GraphQL */ `
   extend type Query {
     priceRules(productId: ID, scope: String, activeOnly: Boolean): [PriceRule!]!
     schemes(activeOnly: Boolean): [Scheme!]!
-    resolvePrice(productId: ID!, dealerTier: String, state: String, quantity: Int = 1): ResolvedPrice!
+    resolvePrice(productId: ID!, dealerTier: String, state: String, quantity: Float = 1): ResolvedPrice!
   }
 
   extend type Mutation {
@@ -114,18 +115,37 @@ const mapScheme = (r) =>
     createdAt: r.created_at,
   };
 
-const ruleValues = (i) => [
-  i.productId,
-  i.scope,
-  i.state ?? null,
-  i.district ?? null,
-  i.dealerTier ?? null,
-  i.price,
-  i.minQuantity ?? 1,
-  i.discountPct ?? 0,
-  i.validFrom ?? null,
-  i.validTo ?? null,
-];
+const SCOPES = ['BASE', 'REGION', 'SEASON', 'PROMO', 'DEALER_TIER'];
+const t = (v) => (typeof v === 'string' ? v.trim() || null : v ?? null);
+
+function checkValidity(from, to) {
+  if (from && to && to < from) throw httpError('"Valid to" must be on or after "Valid from"', 400);
+}
+
+// Validate + normalise ("" → null, upper-case tier to match distributors.dealer_tier).
+const ruleValues = (i) => {
+  if (!i.productId) throw httpError('Select a product', 400);
+  const scope = String(i.scope ?? 'BASE').trim().toUpperCase();
+  if (!SCOPES.includes(scope)) throw httpError(`Scope must be one of ${SCOPES.join(', ')}`, 400);
+  if (!(i.price >= 0 && i.price < 1e10)) throw httpError('Price must be 0 or more', 400);
+  const minQty = i.minQuantity ?? 1;
+  if (minQty < 1) throw httpError('Min quantity must be at least 1', 400);
+  const disc = i.discountPct ?? 0;
+  if (!(disc >= 0 && disc <= 100)) throw httpError('Discount % must be between 0 and 100', 400);
+  const from = t(i.validFrom);
+  const to = t(i.validTo);
+  checkValidity(from, to);
+  return [i.productId, scope, t(i.state), t(i.district), t(i.dealerTier)?.toUpperCase() ?? null, i.price, minQty, disc, from, to];
+};
+
+const schemeValues = (i) => {
+  const name = t(i.name);
+  if (!name) throw httpError('Scheme name is required', 400);
+  const from = t(i.validFrom);
+  const to = t(i.validTo);
+  checkValidity(from, to);
+  return [name, t(i.schemeType) ?? 'DISCOUNT', t(i.description), JSON.stringify(i.config ?? {}), from, to];
+};
 
 export function pricingResolvers() {
   return {
@@ -138,7 +158,7 @@ export function pricingResolvers() {
              AND ($2::text IS NULL OR scope = $2)
              AND ($3::bool IS NULL OR is_active = $3)
            ORDER BY created_at DESC`,
-          [productId ?? null, scope ?? null, activeOnly ?? null],
+          [productId || null, scope || null, activeOnly ?? null],
         );
         return rows.map(mapRule);
       },
@@ -162,16 +182,16 @@ export function pricingResolvers() {
         const { rows } = await query(
           `SELECT * FROM price_rules
            WHERE product_id = $1 AND is_active = TRUE
-             AND min_quantity <= $2
+             AND min_quantity <= $2::numeric
              AND (valid_from IS NULL OR valid_from <= CURRENT_DATE)
              AND (valid_to IS NULL OR valid_to >= CURRENT_DATE)
-             AND (dealer_tier IS NULL OR dealer_tier = $3)
-             AND (state IS NULL OR state = $4)
+             AND (dealer_tier IS NULL OR upper(dealer_tier) = upper($3))
+             AND (state IS NULL OR lower(state) = lower($4))
            -- specificity: dealer-tier & state matches first, then larger qty slab, then cheaper
            ORDER BY (dealer_tier IS NOT NULL)::int + (state IS NOT NULL)::int DESC,
                     min_quantity DESC, price ASC
            LIMIT 1`,
-          [productId, quantity, dealerTier ?? null, state ?? null],
+          [productId, quantity ?? 1, t(dealerTier), t(state)],
         );
 
         const rule = rows[0];
@@ -236,14 +256,7 @@ export function pricingResolvers() {
         const { rows } = await query(
           `INSERT INTO schemes (name, scheme_type, description, config, valid_from, valid_to)
            VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-          [
-            input.name,
-            input.schemeType,
-            input.description ?? null,
-            JSON.stringify(input.config ?? {}),
-            input.validFrom ?? null,
-            input.validTo ?? null,
-          ],
+          schemeValues(input),
         );
         await logActivity(actor.sub, 'CREATE_SCHEME', 'scheme', rows[0].id);
         return mapScheme(rows[0]);
@@ -253,15 +266,7 @@ export function pricingResolvers() {
         const { rows } = await query(
           `UPDATE schemes SET name=$2, scheme_type=$3, description=$4, config=$5,
              valid_from=$6, valid_to=$7, updated_at=now() WHERE id=$1 RETURNING *`,
-          [
-            id,
-            input.name,
-            input.schemeType,
-            input.description ?? null,
-            JSON.stringify(input.config ?? {}),
-            input.validFrom ?? null,
-            input.validTo ?? null,
-          ],
+          [id, ...schemeValues(input)],
         );
         if (!rows[0]) throw httpError('Scheme not found', 404);
         await logActivity(actor.sub, 'UPDATE_SCHEME', 'scheme', id);
@@ -289,9 +294,7 @@ export function pricingResolvers() {
     PriceRule: {
       product: async (parent) => {
         const { rows } = await query('SELECT * FROM products WHERE id = $1', [parent.productId]);
-        if (!rows[0]) return null;
-        const { mapProduct } = await import('./products.js');
-        return mapProduct(rows[0]);
+        return rows[0] ? mapProduct(rows[0]) : null;
       },
     },
   };

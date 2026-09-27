@@ -23,6 +23,7 @@ export const inventoryTypeDefs = /* GraphQL */ `
     productName: String!
     productSku: String!
     uom: String
+    packingSize: String   # quantities count packs of this size (e.g. 250ml)
     batchId: ID!
     batchNumber: String!
     expiryDate: String
@@ -40,6 +41,8 @@ export const inventoryTypeDefs = /* GraphQL */ `
     id: ID!
     warehouseName: String
     productName: String
+    uom: String
+    packingSize: String
     batchNumber: String
     movementType: String!
     quantity: Float!
@@ -76,7 +79,7 @@ export const inventoryTypeDefs = /* GraphQL */ `
     manufacturingDate: String
     expiryDate: String
     quantity: Float!
-    reorderLevel: Float = 0
+    reorderLevel: Float   # omit/null keeps the existing level (0 for a new line)
   }
 
   input StockAdjustInput {
@@ -120,6 +123,7 @@ const mapStock = (r) => {
     productName: r.product_name,
     productSku: r.product_sku,
     uom: r.uom,
+    packingSize: r.packing_size,
     batchId: r.batch_id,
     batchNumber: r.batch_number,
     expiryDate: isoDate(r.expiry_date),
@@ -135,7 +139,7 @@ const mapStock = (r) => {
 };
 
 const STOCK_SELECT = `
-  SELECT sl.*, w.name AS warehouse_name, p.name AS product_name, p.sku AS product_sku, p.uom AS uom,
+  SELECT sl.*, w.name AS warehouse_name, p.name AS product_name, p.sku AS product_sku, p.uom AS uom, p.packing_size,
          p.distributor_price, p.dealer_price, p.mrp,
          b.batch_number, b.expiry_date
   FROM stock_levels sl
@@ -165,17 +169,18 @@ export function inventoryResolvers() {
              AND ($4::bool IS NOT TRUE OR sl.quantity <= sl.reorder_level)
              AND ($5::int IS NULL OR (b.expiry_date IS NOT NULL AND b.expiry_date <= CURRENT_DATE + ($5 || ' days')::interval))
            ORDER BY p.name ASC, b.expiry_date ASC NULLS LAST`,
-          [warehouseId ?? null, productId ?? null, search ?? null, lowOnly ?? null, expiringDays ?? null],
+          [warehouseId || null, productId || null, search?.trim() || null, lowOnly ?? null, expiringDays ?? null],
         );
         return rows.map(mapStock);
       },
       stockMovements: async (_p, { productId, limit }, ctx) => {
         assertAuth(ctx);
-        // OUT movements carry ref_id = order_id (dispatch on invoice). Resolve the
-        // order's counterparty (distributor or farmer) so the timeline shows who got the stock.
+        // OUT movements carry ref_id = order_id (dispatch on invoice) or party_sales.id (direct sale).
+        // Resolve the counterparty (distributor or farmer) so the timeline shows who got the stock.
         const { rows } = await query(
-          `SELECT m.*, w.name AS warehouse_name, p.name AS product_name, b.batch_number,
-                  o.order_no AS document_no, o.customer_type, iv.id AS invoice_id,
+          `SELECT m.*, w.name AS warehouse_name, p.name AS product_name, p.uom, p.packing_size, b.batch_number,
+                  COALESCE(o.order_no, ps.sale_no) AS document_no, COALESCE(o.customer_type, ps.party_type) AS customer_type,
+                  iv.id AS invoice_id,
                   d.name AS distributor_name, d.phone AS distributor_phone,
                   d.contact_person AS distributor_contact, d.gstin AS distributor_gstin,
                   f.name AS farmer_name, f.phone AS farmer_phone, f.village AS farmer_village
@@ -184,12 +189,13 @@ export function inventoryResolvers() {
            JOIN products p ON p.id = m.product_id
            LEFT JOIN batches b ON b.id = m.batch_id
            LEFT JOIN orders o ON m.ref_type = 'invoice' AND o.id = m.ref_id
+           LEFT JOIN party_sales ps ON m.ref_type = 'party_sale' AND ps.id = m.ref_id
            LEFT JOIN invoices iv ON iv.order_id = m.ref_id AND m.ref_type = 'invoice'
-           LEFT JOIN distributors d ON o.customer_type <> 'FARMER' AND d.id = o.distributor_id
-           LEFT JOIN farmers f ON o.customer_type = 'FARMER' AND f.id = o.farmer_id
+           LEFT JOIN distributors d ON COALESCE(o.customer_type, ps.party_type) <> 'FARMER' AND d.id = COALESCE(o.distributor_id, ps.distributor_id)
+           LEFT JOIN farmers f ON COALESCE(o.customer_type, ps.party_type) = 'FARMER' AND f.id = COALESCE(o.farmer_id, ps.farmer_id)
            WHERE ($1::uuid IS NULL OR m.product_id = $1)
            ORDER BY m.created_at DESC LIMIT $2`,
-          [productId ?? null, limit],
+          [productId || null, Math.min(Math.max(limit ?? 50, 1), 2000)],
         );
         return rows.map((r) => {
           const isFarmer = r.customer_type === 'FARMER';
@@ -197,6 +203,8 @@ export function inventoryResolvers() {
             id: r.id,
             warehouseName: r.warehouse_name,
             productName: r.product_name,
+            uom: r.uom,
+            packingSize: r.packing_size,
             batchNumber: r.batch_number,
             movementType: r.movement_type,
             quantity: num(r.quantity),
@@ -220,7 +228,7 @@ export function inventoryResolvers() {
              COUNT(*)::int AS sku_lines,
              COALESCE(SUM(sl.quantity),0) AS total_units,
              COUNT(*) FILTER (WHERE sl.quantity <= sl.reorder_level)::int AS low_stock,
-             COUNT(*) FILTER (WHERE b.expiry_date IS NOT NULL AND b.expiry_date <= CURRENT_DATE + INTERVAL '30 days')::int AS expiring_soon
+             COUNT(*) FILTER (WHERE sl.quantity > 0 AND b.expiry_date IS NOT NULL AND b.expiry_date <= CURRENT_DATE + INTERVAL '30 days')::int AS expiring_soon
            FROM stock_levels sl JOIN batches b ON b.id = sl.batch_id`,
         );
         return {
@@ -235,9 +243,11 @@ export function inventoryResolvers() {
     Mutation: {
       createWarehouse: async (_p, { input }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
+        const name = input.name?.trim();
+        if (!name) throw httpError('Warehouse name is required', 400);
         const { rows } = await query(
           `INSERT INTO warehouses (name, code, branch_id) VALUES ($1,$2,$3) RETURNING *`,
-          [input.name, input.code ?? null, input.branchId ?? null],
+          [name, input.code?.trim() || null, input.branchId || null],
         );
         await logActivity(actor.sub, 'CREATE_WAREHOUSE', 'warehouse', rows[0].id);
         return mapWarehouse(rows[0]);
@@ -245,8 +255,17 @@ export function inventoryResolvers() {
 
       stockIn: async (_p, { input }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
-        if (input.quantity <= 0) throw httpError('Quantity must be positive', 400);
-        return withTransaction(async (client) => {
+        const batchNumber = input.batchNumber?.trim();
+        if (!input.warehouseId) throw httpError('Select a warehouse', 400);
+        if (!input.productId) throw httpError('Select a product', 400);
+        if (!batchNumber) throw httpError('Batch number is required', 400);
+        if (!(input.quantity > 0)) throw httpError('Quantity must be greater than 0', 400);
+        if (input.reorderLevel != null && input.reorderLevel < 0) throw httpError('Reorder level cannot be negative', 400);
+        const mfg = input.manufacturingDate || null;
+        const exp = input.expiryDate || null;
+        if (mfg && exp && exp < mfg) throw httpError('Expiry date must be after the manufacturing date', 400);
+        // Activity log is written after COMMIT: logging on a second pooled connection while the tx is open ties up two connections.
+        const stock = await withTransaction(async (client) => {
           // find or create the batch for this product
           const batch = await client.query(
             `INSERT INTO batches (product_id, batch_number, manufacturing_date, expiry_date)
@@ -255,19 +274,19 @@ export function inventoryResolvers() {
                manufacturing_date = COALESCE(EXCLUDED.manufacturing_date, batches.manufacturing_date),
                expiry_date = COALESCE(EXCLUDED.expiry_date, batches.expiry_date)
              RETURNING id`,
-            [input.productId, input.batchNumber, input.manufacturingDate ?? null, input.expiryDate ?? null],
+            [input.productId, batchNumber, mfg, exp],
           );
           const batchId = batch.rows[0].id;
 
           // upsert stock level
           await client.query(
             `INSERT INTO stock_levels (warehouse_id, product_id, batch_id, quantity, reorder_level)
-             VALUES ($1,$2,$3,$4,$5)
+             VALUES ($1,$2,$3,$4,COALESCE($5::numeric, 0))
              ON CONFLICT (warehouse_id, product_id, batch_id) DO UPDATE SET
                quantity = stock_levels.quantity + EXCLUDED.quantity,
-               reorder_level = EXCLUDED.reorder_level,
+               reorder_level = COALESCE($5::numeric, stock_levels.reorder_level),
                updated_at = now()`,
-            [input.warehouseId, input.productId, batchId, input.quantity, input.reorderLevel ?? 0],
+            [input.warehouseId, input.productId, batchId, input.quantity, input.reorderLevel ?? null],
           );
 
           await client.query(
@@ -282,11 +301,16 @@ export function inventoryResolvers() {
           );
           return mapStock(rows[0]);
         });
+        await logActivity(actor.sub, 'STOCK_IN', 'stock_level', stock.id, { batch: batchNumber, quantity: input.quantity });
+        return stock;
       },
 
       stockAdjust: async (_p, { input }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
-        return withTransaction(async (client) => {
+        const reason = input.reason?.trim();
+        if (!input.quantityDelta) throw httpError('Enter a non-zero quantity change', 400);
+        if (!reason) throw httpError('Reason is required', 400);
+        const stock = await withTransaction(async (client) => {
           const cur = await client.query('SELECT * FROM stock_levels WHERE id = $1 FOR UPDATE', [
             input.stockLevelId,
           ]);
@@ -305,16 +329,15 @@ export function inventoryResolvers() {
               cur.rows[0].product_id,
               cur.rows[0].batch_id,
               input.quantityDelta,
-              input.reason,
+              reason,
               actor.sub,
             ],
           );
           const { rows } = await client.query(`${STOCK_SELECT} WHERE sl.id = $1`, [input.stockLevelId]);
-          await logActivity(actor.sub, 'STOCK_ADJUST', 'stock_level', input.stockLevelId, {
-            delta: input.quantityDelta,
-          });
           return mapStock(rows[0]);
         });
+        await logActivity(actor.sub, 'STOCK_ADJUST', 'stock_level', input.stockLevelId, { delta: input.quantityDelta, reason });
+        return stock;
       },
     },
   };

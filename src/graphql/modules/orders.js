@@ -15,6 +15,8 @@ export const orderTypeDefs = /* GraphQL */ `
     productName: String!
     hsnCode: String
     uom: String
+    "Pack size snapshot (e.g. 250ml); quantity counts packs."
+    packingSize: String
     quantity: Float!
     unitPrice: Float!
     discountPct: Float!
@@ -51,6 +53,9 @@ export const orderTypeDefs = /* GraphQL */ `
     freightCharges: Float
     freightType: String
     dispatchThrough: String
+    deliveryNote: String
+    deliveryNoteDate: String
+    dispatchDocNo: String
   }
 
   type Order {
@@ -232,6 +237,9 @@ export const orderTypeDefs = /* GraphQL */ `
     freightCharges: Float
     freightType: String
     dispatchThrough: String
+    deliveryNote: String
+    deliveryNoteDate: String
+    dispatchDocNo: String
   }
 
   input CreateOrderInput {
@@ -263,6 +271,8 @@ export const orderTypeDefs = /* GraphQL */ `
     amount: Float!
     method: String
     reference: String
+    "Receipt date (YYYY-MM-DD); defaults to now."
+    paidAt: String
   }
 
   extend type Query {
@@ -282,7 +292,7 @@ export const orderTypeDefs = /* GraphQL */ `
 
   extend type Mutation {
     createOrder(input: CreateOrderInput!): Order!
-    updateOrderTransport(orderId: ID!, input: OrderTransportInput!): Order!
+    updateOrderTransport(orderId: ID!, input: OrderTransportInput!, placeOfSupply: String): Order!
     approveOrder(id: ID!): Order!
     generateInvoice(orderId: ID!, invoiceDate: String): Invoice!
     recordPayment(input: PaymentInput!): Payment!
@@ -301,6 +311,7 @@ const mapLine = (r) => ({
   productName: r.product_name,
   hsnCode: r.hsn_code,
   uom: r.uom,
+  packingSize: r.packing_size ?? null,
   quantity: num(r.quantity),
   unitPrice: num(r.unit_price),
   discountPct: num(r.discount_pct),
@@ -329,6 +340,9 @@ const mapTransport = (r) =>
     freightCharges: r.freight_charges == null ? null : num(r.freight_charges),
     freightType: r.freight_type ?? null,
     dispatchThrough: r.dispatch_through ?? null,
+    deliveryNote: r.delivery_note ?? null,
+    deliveryNoteDate: r.delivery_note_date ? isoDate(r.delivery_note_date) : null,
+    dispatchDocNo: r.dispatch_doc_no ?? null,
   };
 
 const mapOrder = (r) =>
@@ -358,7 +372,7 @@ const mapOrder = (r) =>
 function buildBillSnapshot(customerType, row, override = {}) {
   const base = customerType === 'FARMER'
     ? { name: row.name, firmName: row.name, gstin: null, address: row.village ?? null, city: row.village ?? null, district: row.district ?? null, state: row.state ?? null, pincode: null, phone: row.phone ?? null }
-    : { name: row.name, firmName: row.name, gstin: row.gstin ?? null, address: row.address ?? null, city: row.district ?? null, district: row.district ?? null, state: row.state ?? null, pincode: null, phone: row.phone ?? null };
+    : { name: row.name, firmName: row.name, gstin: row.gstin ?? null, address: row.address ?? null, city: row.district ?? null, district: row.district ?? null, state: row.state ?? null, pincode: row.pincode ?? null, phone: row.phone ?? null };
   const o = override || {};
   const pick = (k) => (o[k] != null && o[k] !== '' ? o[k] : base[k]);
   return {
@@ -395,6 +409,60 @@ const mapInvoice = (r) =>
   };
 
 const round2 = (n) => Math.round(n * 100) / 100;
+const blank = (v) => (v === '' || v === undefined ? null : v); // "" from forms → NULL
+
+// Price + snapshot order lines (shared by createOrder/updateOrder) with one product
+// lookup. Farmers (B2C) default to MRP, distributors to the distributor price;
+// NON_GST bills carry no tax. The bill-level discount (₹) is clamped to [0, subTotal]
+// and spread proportionally so per-line GST is charged on the post-discount value.
+async function priceOrder(client, inputLines, customerType, billType, discountAmount) {
+  const ids = [...new Set(inputLines.map((l) => l.productId))];
+  const byId = new Map((await client.query('SELECT * FROM products WHERE id = ANY($1::uuid[])', [ids])).rows.map((p) => [p.id, p]));
+  let subTotal = 0;
+  const lines = inputLines.map((l) => {
+    const p = byId.get(l.productId);
+    if (!p) throw httpError('Product not found', 404);
+    if (!(num(l.quantity) > 0)) throw httpError(`Quantity for ${p.name} must be greater than 0`, 400);
+    const defaultPrice = customerType === 'FARMER'
+      ? num(p.mrp ?? p.dealer_price ?? p.distributor_price ?? 0)
+      : num(p.distributor_price ?? p.dealer_price ?? p.mrp ?? 0);
+    const unitPrice = l.unitPrice ?? defaultPrice;
+    if (!(unitPrice >= 0)) throw httpError(`Price for ${p.name} cannot be negative`, 400);
+    const disc = l.discountPct ?? 0;
+    if (disc < 0 || disc > 100) throw httpError(`Discount for ${p.name} must be between 0 and 100%`, 400);
+    const lineTotal = round2(l.quantity * unitPrice * (1 - disc / 100));
+    const gst = billType === 'GST' ? num(p.gst_percent ?? 0) : 0;
+    subTotal += lineTotal;
+    return { p, l, unitPrice, disc, lineTotal, gst };
+  });
+  subTotal = round2(subTotal);
+  const discountTotal = round2(Math.min(Math.max(num(discountAmount) || 0, 0), subTotal));
+  const factor = subTotal > 0 ? (subTotal - discountTotal) / subTotal : 1;
+  let taxTotal = 0;
+  for (const ln of lines) taxTotal += round2((ln.lineTotal * factor * ln.gst) / 100);
+  taxTotal = round2(taxTotal);
+  return { lines, subTotal, discountTotal, taxTotal, total: round2(subTotal - discountTotal + taxTotal) };
+}
+
+// Reverse loyalty coins credited to a referred farmer when the order is cancelled/deleted.
+async function reverseLoyalty(client, orderId) {
+  await client.query(
+    `UPDATE farmers f SET points_balance = GREATEST(f.points_balance - t.points, 0)
+     FROM loyalty_transactions t WHERE t.ref_order_id = $1 AND t.type = 'EARN' AND f.id = t.farmer_id`,
+    [orderId],
+  );
+  await client.query("DELETE FROM loyalty_transactions WHERE ref_order_id = $1 AND type = 'EARN'", [orderId]);
+}
+
+async function insertOrderLines(client, orderId, lines) {
+  for (const { p, l, unitPrice, disc, lineTotal, gst } of lines) {
+    await client.query(
+      `INSERT INTO order_lines (order_id, product_id, product_name, hsn_code, uom, packing_size, quantity, unit_price, discount_pct, gst_percent, line_total)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [orderId, p.id, p.name, p.hsn_code, p.uom, p.packing_size ?? null, l.quantity, unitPrice, disc, gst, lineTotal],
+    );
+  }
+}
 
 // Resolve an order/invoice customer (distributor or farmer) into a generic shape.
 async function resolveCustomer(customerType, distributorId, farmerId) {
@@ -406,6 +474,11 @@ async function resolveCustomer(customerType, distributorId, farmerId) {
   const d = (await query('SELECT * FROM distributors WHERE id = $1', [distributorId])).rows[0];
   return d && { type: 'DISTRIBUTOR', id: d.id, name: d.name, gstin: d.gstin, state: d.state, address: d.address, phone: d.phone };
 }
+
+// Per-parent memo: customer/customerName (and an invoice's order/transport/billAddress)
+// hit the same row — the promise is cached on the parent object for this request.
+const customerOf = (parent) => (parent._customer ??= resolveCustomer(parent.customerType, parent.distributorId, parent.farmerId));
+const orderRowOf = (parent) => (parent._orderRow ??= query('SELECT * FROM orders WHERE id = $1', [parent.orderId]).then((r) => r.rows[0]));
 
 function financialYear(dateStr) {
   const d = dateStr ? new Date(dateStr) : new Date();
@@ -467,8 +540,14 @@ export function orderResolvers() {
     Query: {
       orders: async (_p, { status, distributorId, billType, search, dateFrom, dateTo, limit, offset }, ctx) => {
         assertAuth(ctx);
+        // item count, customer name and the invoice ride along in one round-trip so the
+        // Order field resolvers below don't fire 3 extra queries per row.
         const { rows } = await query(
-          `SELECT o.* FROM orders o
+          `SELECT o.*,
+                  (SELECT COUNT(*) FROM order_lines ol WHERE ol.order_id = o.id)::int AS _item_count,
+                  CASE WHEN o.customer_type = 'FARMER' AND o.farmer_id IS NOT NULL THEN f.name ELSE d.name END AS _customer_name,
+                  (SELECT row_to_json(i) FROM invoices i WHERE i.order_id = o.id LIMIT 1) AS _invoice
+           FROM orders o
            LEFT JOIN distributors d ON d.id = o.distributor_id
            LEFT JOIN farmers f ON f.id = o.farmer_id
            WHERE ($1::text IS NULL OR o.status = $1::order_status)
@@ -478,9 +557,12 @@ export function orderResolvers() {
              AND ($5::date IS NULL OR o.order_date <= $5::date)
              AND ($6::text IS NULL OR o.bill_type = $6)
            ORDER BY o.created_at DESC LIMIT $7 OFFSET $8`,
-          [status ?? null, distributorId ?? null, search ?? null, dateFrom ?? null, dateTo ?? null, billType ?? null, limit, offset],
+          [status || null, distributorId || null, search?.trim() || null, dateFrom || null, dateTo || null, billType || null,
+           Math.min(Math.max(limit ?? 50, 1), 500), Math.max(offset ?? 0, 0)],
         );
-        return rows.map(mapOrder);
+        return rows.map((r) => ({
+          ...mapOrder(r), _itemCount: r._item_count, _customerName: r._customer_name ?? null, _invoice: mapInvoice(r._invoice) ?? null,
+        }));
       },
       order: async (_p, { id }, ctx) => {
         assertAuth(ctx);
@@ -493,7 +575,7 @@ export function orderResolvers() {
           `SELECT * FROM invoices
            WHERE ($1::uuid IS NULL OR distributor_id = $1)
            ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
-          [distributorId ?? null, limit, offset],
+          [distributorId || null, Math.min(Math.max(limit ?? 50, 1), 500), Math.max(offset ?? 0, 0)],
         );
         return rows.map(mapInvoice);
       },
@@ -680,52 +762,26 @@ export function orderResolvers() {
           // or the "Edit Address" override) so historical bills never change later.
           const billSnap = buildBillSnapshot(customerType, partyRow, input.billAddress);
 
-          // Snapshot product data + compute line totals. Non-GST orders carry no tax.
-          // Farmers (B2C) are billed at MRP/dealer price; distributors at the distributor price.
-          let subTotal = 0;
-          const lines = [];
-          for (const l of input.lines) {
-            const pr = await client.query('SELECT * FROM products WHERE id = $1', [l.productId]);
-            const p = pr.rows[0];
-            if (!p) throw httpError('Product not found', 404);
-            const defaultPrice = customerType === 'FARMER'
-              ? num(p.mrp ?? p.dealer_price ?? p.distributor_price ?? 0)
-              : num(p.distributor_price ?? p.dealer_price ?? p.mrp ?? 0);
-            const unitPrice = l.unitPrice ?? defaultPrice;
-            const disc = l.discountPct ?? 0;
-            const lineTotal = round2(l.quantity * unitPrice * (1 - disc / 100));
-            const gst = billType === 'GST' ? num(p.gst_percent ?? 0) : 0;
-            subTotal += lineTotal;
-            lines.push({ p, l, unitPrice, disc, lineTotal, gst });
-          }
-          subTotal = round2(subTotal);
-          // Bill-level discount (₹). Clamp to [0, subTotal]; spread proportionally so
-          // per-line GST stays correct (tax is charged on the post-discount value).
-          const discountTotal = round2(Math.min(Math.max(num(input.discountAmount) || 0, 0), subTotal));
-          const factor = subTotal > 0 ? (subTotal - discountTotal) / subTotal : 1;
-          let taxTotal = 0;
-          for (const ln of lines) taxTotal += round2((ln.lineTotal * factor * ln.gst) / 100);
-          taxTotal = round2(taxTotal);
-          const total = round2(subTotal - discountTotal + taxTotal);
+          const { lines, subTotal, discountTotal, taxTotal, total } = await priceOrder(client, input.lines, customerType, billType, input.discountAmount);
 
           const orderNo = `ORD-${financialYear(input.orderDate)}-${String(
             (await client.query("SELECT nextval('order_seq') AS n")).rows[0].n,
           ).padStart(5, '0')}`;
 
-          // Transport & logistics (GST only) — non-GST bills skip transport entirely.
-          const t = billType === 'NON_GST' ? {} : (input.transport ?? {});
-          const deliveryAddress = t.deliveryAddress ?? input.deliveryAddress ?? null;
+          // Document and dispatch fields are used on both GST and Non-GST bills.
+          const t = Object.fromEntries(Object.entries(input.transport ?? {}).map(([k, v]) => [k, blank(v)]));
+          const deliveryAddress = t.deliveryAddress ?? blank(input.deliveryAddress);
           const ord = await client.query(
             `INSERT INTO orders (
                order_no, distributor_id, farmer_id, customer_type, farmer_ref, bill_type, status, order_date,
                sub_total, discount_total, tax_total, total_amount, notes, delivery_address, created_by,
                transport_name, transporter_id, vehicle_no, driver_name, driver_mobile, lr_number, lr_date,
                dispatch_date, delivery_location, eway_bill_no, num_packages, total_weight, freight_charges,
-               freight_type, dispatch_through, bill_address)
+               freight_type, dispatch_through, bill_address, delivery_note, delivery_note_date, dispatch_doc_no)
              VALUES ($1,$2,$3,$4,$5,$6,'PLACED',COALESCE($7,CURRENT_DATE),$8,$9,$10,$11,$12,$13,$14,
-               $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30::jsonb) RETURNING *`,
-            [orderNo, distributorId, farmerId, customerType, input.farmerRef?.trim() || null, billType, input.orderDate ?? null, subTotal, discountTotal, taxTotal, total, input.notes ?? null, deliveryAddress, actor.sub,
-             t.transportName ?? null, t.transporterId ?? null, t.vehicleNo ?? null, t.driverName ?? null, t.driverMobile ?? null, t.lrNumber ?? null, t.lrDate ?? null, t.dispatchDate ?? null, t.deliveryLocation ?? null, t.ewayBillNo ?? null, t.numPackages ?? null, t.totalWeight ?? null, t.freightCharges ?? null, t.freightType ?? null, t.dispatchThrough ?? null, JSON.stringify(billSnap)],
+               $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30::jsonb,$31,$32,$33) RETURNING *`,
+            [orderNo, distributorId, farmerId, customerType, input.farmerRef?.trim() || null, billType, blank(input.orderDate), subTotal, discountTotal, taxTotal, total, blank(input.notes), deliveryAddress, actor.sub,
+             t.transportName ?? null, t.transporterId ?? null, t.vehicleNo ?? null, t.driverName ?? null, t.driverMobile ?? null, t.lrNumber ?? null, t.lrDate ?? null, t.dispatchDate ?? null, t.deliveryLocation ?? null, billType === 'GST' ? t.ewayBillNo ?? null : null, t.numPackages ?? null, t.totalWeight ?? null, t.freightCharges ?? null, t.freightType ?? null, t.dispatchThrough ?? null, JSON.stringify(billSnap), t.deliveryNote ?? null, t.deliveryNoteDate ?? null, t.dispatchDocNo ?? null],
           );
           const orderId = ord.rows[0].id;
 
@@ -735,8 +791,9 @@ export function orderResolvers() {
             if (customerType === 'DISTRIBUTOR') {
               await client.query(
                 `UPDATE distributors SET name=COALESCE($2,name), gstin=COALESCE($3,gstin), address=COALESCE($4,address),
-                   district=COALESCE($5,district), state=COALESCE($6,state), phone=COALESCE($7,phone), updated_at=now() WHERE id=$1`,
-                [customerId, billSnap.firmName ?? billSnap.name, billSnap.gstin, billSnap.address, billSnap.district, billSnap.state, billSnap.phone],
+                   district=COALESCE($5,district), state=COALESCE($6,state), phone=COALESCE($7,phone),
+                   pincode=COALESCE($8,pincode), updated_at=now() WHERE id=$1`,
+                [customerId, billSnap.firmName ?? billSnap.name, billSnap.gstin, billSnap.address, billSnap.district, billSnap.state, billSnap.phone, billSnap.pincode],
               );
             } else {
               await client.query(
@@ -762,13 +819,7 @@ export function orderResolvers() {
             }
           }
 
-          for (const { p, l, unitPrice, disc, lineTotal, gst } of lines) {
-            await client.query(
-              `INSERT INTO order_lines (order_id, product_id, product_name, hsn_code, uom, quantity, unit_price, discount_pct, gst_percent, line_total)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-              [orderId, p.id, p.name, p.hsn_code, p.uom, l.quantity, unitPrice, disc, gst, lineTotal],
-            );
-          }
+          await insertOrderLines(client, orderId, lines);
           await logActivity(actor.sub, 'CREATE_ORDER', 'order', orderId, { orderNo });
           return mapOrder(ord.rows[0]);
         });
@@ -776,25 +827,49 @@ export function orderResolvers() {
 
       // Add or edit the transport & logistics block on an existing order. Used by
       // the order workspace (e.g. when filling dispatch details). Does not touch totals.
-      updateOrderTransport: async (_p, { orderId, input }, ctx) => {
+      updateOrderTransport: async (_p, { orderId, input, placeOfSupply }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
-        const t = input ?? {};
-        const { rows } = await query(
-          `UPDATE orders SET
-             transport_name=$2, transporter_id=$3, vehicle_no=$4, driver_name=$5, driver_mobile=$6,
-             lr_number=$7, lr_date=$8, dispatch_date=$9, delivery_location=$10,
-             delivery_address=COALESCE($11, delivery_address), eway_bill_no=$12,
-             num_packages=$13, total_weight=$14, freight_charges=$15, freight_type=$16,
-             dispatch_through=$17, updated_at=now()
-           WHERE id=$1 RETURNING *`,
-          [orderId, t.transportName ?? null, t.transporterId ?? null, t.vehicleNo ?? null, t.driverName ?? null,
-           t.driverMobile ?? null, t.lrNumber ?? null, t.lrDate ?? null, t.dispatchDate ?? null, t.deliveryLocation ?? null,
-           t.deliveryAddress ?? null, t.ewayBillNo ?? null, t.numPackages ?? null, t.totalWeight ?? null,
-           t.freightCharges ?? null, t.freightType ?? null, t.dispatchThrough ?? null],
-        );
-        if (!rows[0]) throw httpError('Order not found', 404);
-        await logActivity(actor.sub, 'UPDATE_ORDER_TRANSPORT', 'order', orderId);
-        return mapOrder(rows[0]);
+        const t = Object.fromEntries(Object.entries(input ?? {}).map(([k, v]) => [k, blank(v)]));
+        const state = typeof placeOfSupply === 'string' ? placeOfSupply.trim() : '';
+        return withTransaction(async (client) => {
+          const order = (await client.query('SELECT * FROM orders WHERE id=$1 FOR UPDATE', [orderId])).rows[0];
+          if (!order) throw httpError('Order not found', 404);
+          if (state && order.bill_type === 'GST') {
+            const invoice = (await client.query('SELECT * FROM invoices WHERE order_id=$1 FOR UPDATE', [orderId])).rows[0];
+            if (invoice?.irn || invoice?.eway_bill_no) throw httpError('Place of supply cannot change after GST e-documents are generated', 400);
+            const company = (await client.query('SELECT state FROM company_settings WHERE id=1')).rows[0];
+            const interstate = order.customer_type !== 'FARMER' && Boolean(company?.state && company.state.trim().toLowerCase() !== state.toLowerCase());
+            await client.query(
+              "UPDATE orders SET bill_address=jsonb_set(COALESCE(bill_address, '{}'::jsonb), '{state}', to_jsonb($2::text), true) WHERE id=$1",
+              [orderId, state],
+            );
+            if (invoice) {
+              const tax = round2(num(invoice.cgst) + num(invoice.sgst) + num(invoice.igst));
+              const cgst = interstate ? 0 : round2(tax / 2);
+              const sgst = interstate ? 0 : round2(tax - cgst);
+              await client.query(
+                'UPDATE invoices SET place_of_supply=$2, is_interstate=$3, cgst=$4, sgst=$5, igst=$6 WHERE id=$1',
+                [invoice.id, state, interstate, cgst, sgst, interstate ? tax : 0],
+              );
+            }
+          }
+          const { rows } = await client.query(
+            `UPDATE orders SET
+               transport_name=$2, transporter_id=$3, vehicle_no=$4, driver_name=$5, driver_mobile=$6,
+               lr_number=$7, lr_date=$8, dispatch_date=$9, delivery_location=$10,
+               delivery_address=COALESCE($11, delivery_address), eway_bill_no=$12,
+               num_packages=$13, total_weight=$14, freight_charges=$15, freight_type=$16,
+               dispatch_through=$17, delivery_note=$18, delivery_note_date=$19, dispatch_doc_no=$20,
+               updated_at=now() WHERE id=$1 RETURNING *`,
+            [orderId, t.transportName ?? null, t.transporterId ?? null, t.vehicleNo ?? null, t.driverName ?? null,
+             t.driverMobile ?? null, t.lrNumber ?? null, t.lrDate ?? null, t.dispatchDate ?? null, t.deliveryLocation ?? null,
+             t.deliveryAddress ?? null, order.bill_type === 'GST' ? t.ewayBillNo ?? null : null,
+             t.numPackages ?? null, t.totalWeight ?? null, t.freightCharges ?? null, t.freightType ?? null,
+             t.dispatchThrough ?? null, t.deliveryNote ?? null, t.deliveryNoteDate ?? null, t.dispatchDocNo ?? null],
+          );
+          await logActivity(actor.sub, 'UPDATE_ORDER_TRANSPORT', 'order', orderId);
+          return mapOrder(rows[0]);
+        });
       },
 
       approveOrder: async (_p, { id }, ctx) => {
@@ -808,7 +883,7 @@ export function orderResolvers() {
           const limit = num(dist.rows[0].credit_limit);
           const exposure = num(dist.rows[0].outstanding) + num(ord.rows[0].total_amount);
           if (limit > 0 && exposure > limit) {
-            throw httpError(`Credit limit exceeded: exposure ₹${exposure} > limit ₹${limit}`, 400);
+            throw httpError(`Credit limit exceeded: outstanding + this order = ₹${exposure.toFixed(2)}, limit ₹${limit.toFixed(2)}`, 400);
           }
         }
         const { rows } = await query(
@@ -835,7 +910,8 @@ export function orderResolvers() {
           const company = (await client.query('SELECT * FROM company_settings WHERE id = 1')).rows[0];
           const isFarmer = order.customer_type === 'FARMER';
           const dist = order.distributor_id ? (await client.query('SELECT * FROM distributors WHERE id = $1', [order.distributor_id])).rows[0] : null;
-          const buyerState = isFarmer ? (company?.state ?? null) : (dist?.state ?? null); // farmers billed B2C, treated intra-state
+          // Place of supply: the state frozen on the bill (Edit Address) → party master. Farmers billed B2C, treated intra-state.
+          const buyerState = isFarmer ? (company?.state || order.bill_address?.state || null) : (order.bill_address?.state || dist?.state || null);
           const lines = (await client.query('SELECT * FROM order_lines WHERE order_id = $1', [orderId])).rows;
 
           // FIFO stock-out per product (negative-stock prevention).
@@ -885,10 +961,9 @@ export function orderResolvers() {
           const seq = (await client.query("SELECT nextval('invoice_seq') AS n")).rows[0].n;
           // Bills of supply carry a distinct series prefix.
           const prefix = type === 'NON_GST' ? 'BOS' : company?.invoice_prefix || 'INV';
-          const invoiceNo = `${prefix}-${financialYear()}-${String(seq).padStart(5, '0')}`;
-
           // Capture the invoice date: explicit override → the order's date → today.
           const invDate = invoiceDate || isoDate(order.order_date) || null;
+          const invoiceNo = `${prefix}-${financialYear(invDate)}-${String(seq).padStart(5, '0')}`;
           const inv = await client.query(
             `INSERT INTO invoices
                (invoice_no, order_id, distributor_id, farmer_id, customer_type, bill_type, invoice_date, place_of_supply, is_interstate,
@@ -907,16 +982,22 @@ export function orderResolvers() {
 
       recordPayment: async (_p, { input }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
-        if (input.amount <= 0) throw httpError('Amount must be positive', 400);
+        if (!(input.amount > 0)) throw httpError('Amount must be greater than 0', 400);
+        const amount = round2(input.amount);
+        const paidAt = blank(input.paidAt);
+        if (paidAt && !/^\d{4}-\d{2}-\d{2}/.test(paidAt)) throw httpError('Payment date must be YYYY-MM-DD', 400);
         return withTransaction(async (client) => {
           const inv = await client.query('SELECT * FROM invoices WHERE id = $1 FOR UPDATE', [input.invoiceId]);
           if (!inv.rows[0]) throw httpError('Invoice not found', 404);
-          await client.query('UPDATE invoices SET amount_paid = amount_paid + $2 WHERE id = $1', [input.invoiceId, input.amount]);
-          if (inv.rows[0].distributor_id) await client.query('UPDATE distributors SET outstanding = GREATEST(outstanding - $2, 0) WHERE id = $1', [inv.rows[0].distributor_id, input.amount]);
+          if (inv.rows[0].status === 'CANCELLED') throw httpError('Cannot record a payment on a cancelled invoice', 400);
+          const due = round2(num(inv.rows[0].total_amount) - num(inv.rows[0].amount_paid));
+          if (amount > due + 0.001) throw httpError(`Amount ₹${amount.toFixed(2)} exceeds the balance due ₹${due.toFixed(2)}`, 400);
+          await client.query('UPDATE invoices SET amount_paid = amount_paid + $2 WHERE id = $1', [input.invoiceId, amount]);
+          if (inv.rows[0].distributor_id) await client.query('UPDATE distributors SET outstanding = GREATEST(outstanding - $2, 0) WHERE id = $1', [inv.rows[0].distributor_id, amount]);
           const pay = await client.query(
-            `INSERT INTO payments (invoice_id, distributor_id, farmer_id, amount, method, reference, created_by)
-             VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-            [input.invoiceId, inv.rows[0].distributor_id, inv.rows[0].farmer_id, input.amount, input.method ?? null, input.reference ?? null, actor.sub],
+            `INSERT INTO payments (invoice_id, distributor_id, farmer_id, amount, method, reference, created_by, paid_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE(($8::date + time '12:00')::timestamptz, now())) RETURNING *`, // noon: the date never shifts across time zones
+            [input.invoiceId, inv.rows[0].distributor_id, inv.rows[0].farmer_id, amount, blank(input.method), blank(input.reference), actor.sub, paidAt],
           );
           await logActivity(actor.sub, 'RECORD_PAYMENT', 'payment', pay.rows[0].id);
           const r = pay.rows[0];
@@ -926,13 +1007,17 @@ export function orderResolvers() {
 
       updateOrderStatus: async (_p, { id, status }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
-        const allowed = ['DISPATCHED', 'DELIVERED'];
-        if (!allowed.includes(status)) throw httpError('Status must be DISPATCHED or DELIVERED', 400);
+        const from = { DISPATCHED: ['INVOICED'], DELIVERED: ['INVOICED', 'DISPATCHED'] }[status];
+        if (!from) throw httpError('Status must be DISPATCHED or DELIVERED', 400);
         const { rows } = await query(
-          'UPDATE orders SET status = $2::order_status, updated_at = now() WHERE id = $1 RETURNING *',
-          [id, status],
+          'UPDATE orders SET status = $2::order_status, updated_at = now() WHERE id = $1 AND status::text = ANY($3) RETURNING *',
+          [id, status, from],
         );
-        if (!rows[0]) throw httpError('Order not found', 404);
+        if (!rows[0]) {
+          const cur = (await query('SELECT status FROM orders WHERE id = $1', [id])).rows[0];
+          if (!cur) throw httpError('Order not found', 404);
+          throw httpError(`A ${cur.status.toLowerCase()} order cannot be marked ${status.toLowerCase()}`, 400);
+        }
         await logActivity(actor.sub, 'ORDER_STATUS', 'order', id, { status });
         return mapOrder(rows[0]);
       },
@@ -943,7 +1028,10 @@ export function orderResolvers() {
         if (!ord.rows[0]) throw httpError('Order not found', 404);
         if (['INVOICED', 'DISPATCHED', 'DELIVERED'].includes(ord.rows[0].status))
           throw httpError('Cannot cancel an invoiced/dispatched order', 400);
-        const { rows } = await query("UPDATE orders SET status='CANCELLED', updated_at=now() WHERE id=$1 RETURNING *", [id]);
+        const rows = await withTransaction(async (client) => {
+          await reverseLoyalty(client, id);
+          return (await client.query("UPDATE orders SET status='CANCELLED', updated_at=now() WHERE id=$1 RETURNING *", [id])).rows;
+        });
         await logActivity(actor.sub, 'CANCEL_ORDER', 'order', id);
         return mapOrder(rows[0]);
       },
@@ -965,44 +1053,19 @@ export function orderResolvers() {
           const customerType = order.customer_type === 'FARMER' ? 'FARMER' : 'DISTRIBUTOR';
 
           // Re-snapshot product data + recompute line totals (same rules as createOrder).
-          let subTotal = 0;
-          const lines = [];
-          for (const l of input.lines) {
-            const p = (await client.query('SELECT * FROM products WHERE id = $1', [l.productId])).rows[0];
-            if (!p) throw httpError('Product not found', 404);
-            const defaultPrice = customerType === 'FARMER'
-              ? num(p.mrp ?? p.dealer_price ?? p.distributor_price ?? 0)
-              : num(p.distributor_price ?? p.dealer_price ?? p.mrp ?? 0);
-            const unitPrice = l.unitPrice ?? defaultPrice;
-            const disc = l.discountPct ?? 0;
-            const lineTotal = round2(l.quantity * unitPrice * (1 - disc / 100));
-            const gst = billType === 'GST' ? num(p.gst_percent ?? 0) : 0;
-            subTotal += lineTotal;
-            lines.push({ p, l, unitPrice, disc, lineTotal, gst });
-          }
-          subTotal = round2(subTotal);
-          const discountTotal = round2(Math.min(Math.max(input.discountAmount != null ? num(input.discountAmount) : num(order.discount_total), 0), subTotal));
-          const factor = subTotal > 0 ? (subTotal - discountTotal) / subTotal : 1;
-          let taxTotal = 0;
-          for (const ln of lines) taxTotal += round2((ln.lineTotal * factor * ln.gst) / 100);
-          taxTotal = round2(taxTotal);
-          const total = round2(subTotal - discountTotal + taxTotal);
+          const { lines, subTotal, discountTotal, taxTotal, total } = await priceOrder(
+            client, input.lines, customerType, billType, input.discountAmount != null ? input.discountAmount : order.discount_total,
+          );
 
           await client.query(
             `UPDATE orders SET order_date = COALESCE($2::date, order_date), notes = $3,
                sub_total = $4, discount_total = $5, tax_total = $6, total_amount = $7, updated_at = now()
              WHERE id = $1`,
-            [id, input.orderDate ?? null, input.notes ?? null, subTotal, discountTotal, taxTotal, total],
+            [id, blank(input.orderDate), blank(input.notes), subTotal, discountTotal, taxTotal, total],
           );
           // Replace the line items wholesale (order_lines cascade-delete with the order).
           await client.query('DELETE FROM order_lines WHERE order_id = $1', [id]);
-          for (const { p, l, unitPrice, disc, lineTotal, gst } of lines) {
-            await client.query(
-              `INSERT INTO order_lines (order_id, product_id, product_name, hsn_code, uom, quantity, unit_price, discount_pct, gst_percent, line_total)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-              [id, p.id, p.name, p.hsn_code, p.uom, l.quantity, unitPrice, disc, gst, lineTotal],
-            );
-          }
+          await insertOrderLines(client, id, lines);
           await logActivity(actor.sub, 'UPDATE_ORDER', 'order', id, { orderNo: order.order_no });
           const updated = (await client.query('SELECT * FROM orders WHERE id = $1', [id])).rows[0];
           return mapOrder(updated);
@@ -1022,6 +1085,9 @@ export function orderResolvers() {
 
           // If the order was invoiced, the invoice FK is RESTRICT — unwind it first.
           const inv = (await client.query('SELECT * FROM invoices WHERE order_id = $1 FOR UPDATE', [id])).rows[0];
+          if (inv?.irn || inv?.eway_bill_no) {
+            throw httpError('This invoice has an e-invoice (IRN) / E-Way Bill. Cancel it on the GST portal first — a registered invoice cannot be deleted.', 400);
+          }
           if (inv) {
             // 1) Put dispatched stock back: reverse the FIFO OUT movements booked at
             //    invoicing (quantity is stored negative, so subtract to add back).
@@ -1052,7 +1118,8 @@ export function orderResolvers() {
             await client.query('DELETE FROM invoices WHERE id = $1', [inv.id]);
           }
 
-          // 4) Delete the order — order_lines cascade; loyalty txns & sales returns unlink.
+          // 4) Delete the order — order_lines cascade; loyalty coins reversed; sales returns unlink.
+          await reverseLoyalty(client, id);
           await client.query('DELETE FROM orders WHERE id = $1', [id]);
           await logActivity(actor.sub, 'DELETE_ORDER', 'order', id, { orderNo: ord.order_no, hadInvoice: !!inv });
           return true;
@@ -1062,6 +1129,7 @@ export function orderResolvers() {
 
     Order: {
       itemCount: async (parent) => {
+        if (parent._itemCount != null) return parent._itemCount;
         const { rows } = await query('SELECT COUNT(*)::int AS n FROM order_lines WHERE order_id = $1', [parent.id]);
         return rows[0].n;
       },
@@ -1074,38 +1142,34 @@ export function orderResolvers() {
         const { rows } = await query('SELECT * FROM distributors WHERE id = $1', [parent.distributorId]);
         return mapDistributor(rows[0]);
       },
-      customer: (parent) => resolveCustomer(parent.customerType, parent.distributorId, parent.farmerId),
-      customerName: async (parent) => (await resolveCustomer(parent.customerType, parent.distributorId, parent.farmerId))?.name ?? null,
+      customer: (parent) => customerOf(parent),
+      customerName: async (parent) => ('_customerName' in parent ? parent._customerName : (await customerOf(parent))?.name ?? null),
       invoice: async (parent) => {
+        if ('_invoice' in parent) return parent._invoice;
         const { rows } = await query('SELECT * FROM invoices WHERE order_id = $1', [parent.id]);
         return mapInvoice(rows[0]);
       },
     },
 
     Invoice: {
-      order: async (parent) => {
-        const { rows } = await query('SELECT * FROM orders WHERE id = $1', [parent.orderId]);
-        return mapOrder(rows[0]);
-      },
+      order: async (parent) => mapOrder(await orderRowOf(parent)),
       // Transport block + billing snapshot are inherited from the parent order.
       transport: async (parent) => {
-        const { rows } = await query('SELECT * FROM orders WHERE id = $1', [parent.orderId]);
-        return rows[0] ? mapTransport(rows[0]) : null;
+        const row = await orderRowOf(parent);
+        return row ? mapTransport(row) : null;
       },
-      billAddress: async (parent) => {
-        const { rows } = await query('SELECT bill_address FROM orders WHERE id = $1', [parent.orderId]);
-        return rows[0]?.bill_address ?? null;
-      },
+      billAddress: async (parent) => (await orderRowOf(parent))?.bill_address ?? null,
       distributor: async (parent) => {
         if (!parent.distributorId) return null;
         const { rows } = await query('SELECT * FROM distributors WHERE id = $1', [parent.distributorId]);
         return mapDistributor(rows[0]);
       },
-      customer: (parent) => resolveCustomer(parent.customerType, parent.distributorId, parent.farmerId),
-      customerName: async (parent) => (await resolveCustomer(parent.customerType, parent.distributorId, parent.farmerId))?.name ?? null,
-      company: async () => {
-        const { rows } = await query('SELECT * FROM company_settings WHERE id = 1');
-        return mapCompany(rows[0]);
+      customer: (parent) => customerOf(parent),
+      customerName: async (parent) => (await customerOf(parent))?.name ?? null,
+      // Same row for every invoice in a request — fetch it once per request.
+      company: async (_parent, _a, ctx) => {
+        ctx._companyRow ??= query('SELECT * FROM company_settings WHERE id = 1').then((r) => r.rows[0]);
+        return mapCompany(await ctx._companyRow);
       },
     },
   };

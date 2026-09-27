@@ -88,7 +88,7 @@ const map = (r) =>
     category: r.category,
     description: r.description,
     status: r.status,
-    priority: r.priority,
+    priority: r.priority === 'MEDIUM' ? 'NORMAL' : r.priority, // legacy app rows used MEDIUM
     photoKey: r.photo_s3_key,
     farmerId: r.farmer_id,
     farmerName: r.farmer_name,
@@ -106,6 +106,15 @@ const map = (r) =>
     _fcmToken: r.fcm_token,
     _farmerPhone: r.farmer_phone,
   };
+
+const STATUSES = ['OPEN', 'ASSIGNED', 'IN_PROGRESS', 'RESOLVED'];
+const PRIORITIES = ['LOW', 'NORMAL', 'HIGH'];
+const blank = (v) => (typeof v === 'string' ? v.trim() || null : v ?? null); // "" → null
+
+function checkPriority(p) {
+  if (p != null && !PRIORITIES.includes(p)) throw httpError(`Priority must be one of ${PRIORITIES.join(', ')}`, 400);
+  return p;
+}
 
 async function addEvent(complaintId, type, detail, actorId) {
   await query(
@@ -129,15 +138,18 @@ async function notifyFarmer(row, title, body) {
 export function complaintResolvers() {
   return {
     Query: {
-      complaints: async (_p, { status, category, search, limit }, ctx) => {
+      complaints: async (_p, args, ctx) => {
         assertAuth(ctx);
+        const status = blank(args.status), category = blank(args.category), search = blank(args.search);
+        if (status && !STATUSES.includes(status)) throw httpError(`Status must be one of ${STATUSES.join(', ')}`, 400);
+        const limit = Math.min(Math.max(args.limit ?? 100, 1), 500);
         const { rows } = await query(
           `${SELECT}
            WHERE ($1::text IS NULL OR c.status = $1::complaint_status)
              AND ($2::text IS NULL OR c.category = $2)
              AND ($3::text IS NULL OR c.ticket_no ILIKE '%' || $3 || '%' OR f.name ILIKE '%' || $3 || '%' OR f.farmer_code ILIKE '%' || $3 || '%')
            ORDER BY c.created_at DESC LIMIT $4`,
-          [status ?? null, category ?? null, search ?? null, limit],
+          [status, category, search, limit],
         );
         return rows.map(map);
       },
@@ -160,7 +172,8 @@ export function complaintResolvers() {
         return { total: r.total, open: r.open, assigned: r.assigned, inProgress: r.in_progress, resolved: r.resolved };
       },
       assignableUsers: async (_p, _a, ctx) => {
-        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
+        // SALES can open the complaint detail (which lists assignees) and move status.
+        assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
         const { rows } = await query(
           "SELECT id, name, role FROM users WHERE is_active AND role IN ('SUPER_ADMIN','ADMIN','SUB_ADMIN','SALES') ORDER BY name",
         );
@@ -171,12 +184,15 @@ export function complaintResolvers() {
     Mutation: {
       createComplaint: async (_p, { input }, ctx) => {
         const actor = assertAuth(ctx);
+        const category = blank(input.category);
+        if (!category) throw httpError('Complaint category is required', 400);
+        const priority = checkPriority(blank(input.priority)) ?? 'NORMAL';
         const seq = (await query("SELECT nextval('complaint_seq') AS n")).rows[0].n;
         const ticketNo = `CMP-${String(seq).padStart(6, '0')}`;
         const { rows } = await query(
           `INSERT INTO complaints (ticket_no, farmer_id, distributor_id, category, description, priority, photo_s3_key, created_by)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
-          [ticketNo, input.farmerId ?? null, input.distributorId ?? null, input.category, input.description ?? null, input.priority ?? 'NORMAL', input.photoKey ?? null, actor.sub],
+          [ticketNo, blank(input.farmerId), blank(input.distributorId), category, blank(input.description), priority, blank(input.photoKey), actor.sub],
         );
         await addEvent(rows[0].id, 'CREATED', `Complaint ${ticketNo} logged`, actor.sub);
         await logActivity(actor.sub, 'CREATE_COMPLAINT', 'complaint', rows[0].id, { ticketNo });
@@ -201,24 +217,28 @@ export function complaintResolvers() {
 
       setComplaintStatus: async (_p, { id, status, resolutionNote }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
-        const allowed = ['OPEN', 'ASSIGNED', 'IN_PROGRESS', 'RESOLVED'];
-        if (!allowed.includes(status)) throw httpError('Invalid status', 400);
+        if (!STATUSES.includes(status)) throw httpError(`Status must be one of ${STATUSES.join(', ')}`, 400);
+        const note = blank(resolutionNote);
+        const cur = (await query('SELECT resolution_note FROM complaints WHERE id=$1', [id])).rows[0];
+        if (!cur) throw httpError('Complaint not found', 404);
+        if (status === 'RESOLVED' && !note && !cur.resolution_note) throw httpError('A resolution note is required to resolve a complaint', 400);
         const resolvedAt = status === 'RESOLVED' ? new Date() : null;
         const { rows } = await query(
           `UPDATE complaints SET status=$2::complaint_status, resolution_note=COALESCE($3, resolution_note),
              resolved_at=$4, updated_at=now() WHERE id=$1 RETURNING ticket_no`,
-          [id, status, resolutionNote ?? null, resolvedAt],
+          [id, status, note, resolvedAt],
         );
-        if (!rows[0]) throw httpError('Complaint not found', 404);
-        await addEvent(id, 'STATUS', `Status → ${status}${resolutionNote ? ` · ${resolutionNote}` : ''}`, actor.sub);
+        await addEvent(id, 'STATUS', `Status → ${status.replace('_', ' ')}${note ? ` · ${note}` : ''}`, actor.sub);
         await logActivity(actor.sub, 'COMPLAINT_STATUS', 'complaint', id, { status });
         const full = await query(`${SELECT} WHERE c.id = $1`, [id]);
         await notifyFarmer(full.rows[0], `Complaint ${rows[0].ticket_no}`, `Your complaint status is now ${status.replace('_', ' ')}.`);
         return map(full.rows[0]);
       },
 
-      addComplaintNote: async (_p, { id, note }, ctx) => {
+      addComplaintNote: async (_p, { id, note: rawNote }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        const note = blank(rawNote);
+        if (!note) throw httpError('Note cannot be empty', 400);
         const c = await query('SELECT id FROM complaints WHERE id = $1', [id]);
         if (!c.rows[0]) throw httpError('Complaint not found', 404);
         await addEvent(id, 'NOTE', note, actor.sub);
@@ -231,7 +251,7 @@ export function complaintResolvers() {
         const { rows } = await query(
           `UPDATE complaints SET category=COALESCE($2,category), description=COALESCE($3,description), priority=COALESCE($4,priority), updated_at=now()
            WHERE id=$1 RETURNING id`,
-          [id, input.category ?? null, input.description ?? null, input.priority ?? null],
+          [id, blank(input.category), blank(input.description), checkPriority(blank(input.priority))],
         );
         if (!rows[0]) throw httpError('Complaint not found', 404);
         await addEvent(id, 'NOTE', 'Complaint details edited', actor.sub);

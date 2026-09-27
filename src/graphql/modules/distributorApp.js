@@ -43,7 +43,7 @@ export const distributorAppTypeDefs = /* GraphQL */ `
   }
   type DistributorAuthPayload { token: String!, distributor: DistributorProfile! }
 
-  type DistInvoiceLine { productName: String!, quantity: Float!, unitPrice: Float!, lineTotal: Float!, uom: String }
+  type DistInvoiceLine { productName: String!, quantity: Float!, unitPrice: Float!, lineTotal: Float!, uom: String, packingSize: String }
   type DistInvoice {
     id: ID!
     invoiceNo: String!
@@ -69,7 +69,7 @@ export const distributorAppTypeDefs = /* GraphQL */ `
   type DistFarmerLookup { id: ID!, farmerCode: String!, name: String!, village: String, phone: String, pointsBalance: Int! }
 
   # A bill the distributor raised to a farmer/buyer (their own resale).
-  type DistSaleLine { productName: String!, quantity: Float!, unitPrice: Float!, gstPercent: Float!, lineTotal: Float! }
+  type DistSaleLine { productName: String!, packingSize: String, quantity: Float!, unitPrice: Float!, gstPercent: Float!, lineTotal: Float! }
   type DistSale {
     id: ID!
     billNo: String!
@@ -159,6 +159,16 @@ const mapSale = (r) => r && {
   paymentMethod: r.payment_method, notes: r.notes, createdAt: r.created_at,
   distributorId: r.distributor_id ?? null, distributorName: r.distributor_name ?? null,
 };
+
+const mapSaleLine = (l) => ({ productName: l.product_name, packingSize: l.packing_size ?? null, quantity: num(l.quantity), unitPrice: num(l.unit_price), gstPercent: num(l.gst_percent), lineTotal: num(l.line_total) });
+
+// Preload the line items of a list of bills in one query (avoids one query per bill).
+async function withItems(sales) {
+  if (!sales.length) return sales;
+  const { rows } = await query('SELECT * FROM distributor_sale_lines WHERE sale_id = ANY($1::uuid[]) ORDER BY product_name', [sales.map((s) => s.id)]);
+  for (const s of sales) s._items = rows.filter((l) => l.sale_id === s.id).map(mapSaleLine);
+  return sales;
+}
 
 const mapProfile = (r) => r && {
   id: r.id, name: r.name, contactPerson: r.contact_person, phone: r.phone, email: r.email,
@@ -253,8 +263,11 @@ export function distributorAppResolvers(app) {
           'SELECT * FROM invoices WHERE distributor_id = $1 ORDER BY created_at DESC',
           [id],
         );
-        return Promise.all(rows.map(async (inv) => {
-          const lines = (await query('SELECT product_name, quantity, unit_price, line_total, uom FROM order_lines WHERE order_id = $1', [inv.order_id])).rows;
+        const allLines = rows.length
+          ? (await query('SELECT order_id, product_name, quantity, unit_price, line_total, uom, packing_size FROM order_lines WHERE order_id = ANY($1::uuid[]) ORDER BY created_at', [rows.map((r) => r.order_id)])).rows
+          : [];
+        return rows.map((inv) => {
+          const lines = allLines.filter((l) => l.order_id === inv.order_id);
           const total = num(inv.total_amount) ?? 0, paid = num(inv.amount_paid) ?? 0;
           return {
             id: inv.id, invoiceNo: inv.invoice_no, billType: inv.bill_type ?? 'GST', invoiceDate: isoDate(inv.invoice_date),
@@ -262,9 +275,9 @@ export function distributorAppResolvers(app) {
             taxableValue: num(inv.taxable_value) ?? 0, cgst: num(inv.cgst) ?? 0, sgst: num(inv.sgst) ?? 0, igst: num(inv.igst) ?? 0,
             totalAmount: total, amountPaid: paid, balanceDue: round2(total - paid),
             irn: inv.irn, ewayBillNo: inv.eway_bill_no, status: inv.status ?? 'ISSUED',
-            items: lines.map((l) => ({ productName: l.product_name, quantity: num(l.quantity), unitPrice: num(l.unit_price), lineTotal: num(l.line_total), uom: l.uom ?? null })),
+            items: lines.map((l) => ({ productName: l.product_name, quantity: num(l.quantity), unitPrice: num(l.unit_price), lineTotal: num(l.line_total), uom: l.uom ?? null, packingSize: l.packing_size ?? null })),
           };
-        }));
+        });
       },
 
       distInvoiceStats: async (_p, _a, ctx) => {
@@ -306,7 +319,7 @@ export function distributorAppResolvers(app) {
            ORDER BY s.created_at DESC`,
           [id, search && search.trim() ? search.trim() : null],
         );
-        return rows.map(mapSale);
+        return withItems(rows.map(mapSale));
       },
 
       distSaleStats: async (_p, _a, ctx) => {
@@ -362,9 +375,9 @@ export function distributorAppResolvers(app) {
              AND ($4::date IS NULL OR s.sale_date >= $4::date)
              AND ($5::date IS NULL OR s.sale_date <= $5::date)
            ORDER BY s.created_at DESC LIMIT $6`,
-          [did ?? null, search && search.trim() ? search.trim() : null, billType ?? null, dateFrom ?? null, dateTo ?? null, limit],
+          [did || null, search && search.trim() ? search.trim() : null, billType || null, dateFrom || null, dateTo || null, Math.min(Math.max(limit ?? 200, 1), 1000)],
         );
-        return rows.map(mapSale);
+        return withItems(rows.map(mapSale));
       },
     },
 
@@ -457,15 +470,17 @@ export function distributorAppResolvers(app) {
           if (!(l.quantity > 0)) throw httpError('Each item needs a quantity greater than 0', 400);
           let name = (l.productName ?? '').trim();
           let gst = l.gstPercent != null ? num(l.gstPercent) : 0;
+          let pack = null;
           if (l.productId) {
-            const p = (await query('SELECT name, gst_percent FROM products WHERE id = $1', [l.productId])).rows[0];
-            if (p) { name = name || p.name; if (l.gstPercent == null) gst = num(p.gst_percent) ?? 0; }
+            const p = (await query('SELECT name, gst_percent, packing_size FROM products WHERE id = $1', [l.productId])).rows[0];
+            if (p) { name = name || p.name; pack = p.packing_size ?? null; if (l.gstPercent == null) gst = num(p.gst_percent) ?? 0; }
           }
           if (!name) throw httpError('Each item needs a product', 400);
           const lineTotal = round2(l.quantity * l.unitPrice);
           subTotal += lineTotal;
           if (billType === 'GST') taxTotal += round2(lineTotal * gst / 100);
-          prepared.push({ productId: l.productId ?? null, name, quantity: l.quantity, unitPrice: l.unitPrice, gst: billType === 'GST' ? gst : 0, lineTotal });
+          if (!(l.unitPrice >= 0)) throw httpError('Price cannot be negative', 400);
+          prepared.push({ productId: l.productId ?? null, name, pack, quantity: l.quantity, unitPrice: l.unitPrice, gst: billType === 'GST' ? gst : 0, lineTotal });
         }
         subTotal = round2(subTotal); taxTotal = round2(taxTotal);
         const total = round2(subTotal + taxTotal);
@@ -480,9 +495,9 @@ export function distributorAppResolvers(app) {
           )).rows[0];
           for (const p of prepared) {
             await client.query(
-              `INSERT INTO distributor_sale_lines (sale_id, product_id, product_name, quantity, unit_price, gst_percent, line_total)
-               VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-              [sale.id, p.productId, p.name, p.quantity, p.unitPrice, p.gst, p.lineTotal],
+              `INSERT INTO distributor_sale_lines (sale_id, product_id, product_name, packing_size, quantity, unit_price, gst_percent, line_total)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+              [sale.id, p.productId, p.name, p.pack, p.quantity, p.unitPrice, p.gst, p.lineTotal],
             );
           }
           await logActivity(null, 'DIST_CREATE_SALE', 'distributor_sale', sale.id, { billNo, via: 'distributor-app' });
@@ -501,17 +516,11 @@ export function distributorAppResolvers(app) {
         const balance = round2(total - already);
         if (balance <= 0) throw httpError('This bill is already fully paid', 400);
         const newPaid = round2(Math.min(total, already + amount));
-        const { rows } = await query(
-          `UPDATE distributor_sales s SET amount_paid = $2 FROM (SELECT farmer_code FROM farmers WHERE id = $3) f
-           WHERE s.id = $1 RETURNING s.*, $4::text farmer_code`,
-          [saleId, newPaid, s.farmer_id, s.farmer_id ? null : null],
-        );
-        // Re-fetch with farmer_code join for a clean mapped result.
+        await query('UPDATE distributor_sales SET amount_paid = $2 WHERE id = $1', [saleId, newPaid]);
         const out = (await query(
           'SELECT s.*, f.farmer_code FROM distributor_sales s LEFT JOIN farmers f ON f.id = s.farmer_id WHERE s.id = $1',
           [saleId],
         )).rows[0];
-        void rows;
         await logActivity(null, 'DIST_SALE_PAYMENT', 'distributor_sale', saleId, { amount, newPaid, via: 'distributor-app' });
         return mapSale(out);
       },
@@ -520,8 +529,9 @@ export function distributorAppResolvers(app) {
     DistributorProfile: { photoUrl: (parent) => imgUrl(parent.photoKey) },
     DistSale: {
       items: async (parent) => {
-        const { rows } = await query('SELECT product_name, quantity, unit_price, gst_percent, line_total FROM distributor_sale_lines WHERE sale_id = $1 ORDER BY product_name', [parent.id]);
-        return rows.map((l) => ({ productName: l.product_name, quantity: num(l.quantity), unitPrice: num(l.unit_price), gstPercent: num(l.gst_percent), lineTotal: num(l.line_total) }));
+        if (parent._items) return parent._items;
+        const { rows } = await query('SELECT * FROM distributor_sale_lines WHERE sale_id = $1 ORDER BY product_name', [parent.id]);
+        return rows.map(mapSaleLine);
       },
     },
     AppProduct: { gstPercent: (parent) => parent.gstPercent ?? null },

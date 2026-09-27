@@ -32,18 +32,45 @@ function bySection(rows) {
 const sumAmt = (arr) => r2((arr ?? []).reduce((s, r) => s + num(r.amount), 0));
 const toLines = (arr) => (arr ?? []).map((r) => ({ label: r.label, amount: r2(num(r.amount)) }));
 
+export const DIFF_LABEL = 'Difference in Opening Balances';
+
+/** yyyy-mm-dd of the day before `iso`. */
+const prevDay = (iso) => new Date(Date.parse(`${iso}T00:00:00Z`) - 86_400_000).toISOString().slice(0, 10);
+
+/** Stock value as at the end of day $1: today's on-hand minus movements after that day. */
+const STOCK_AS_AT = `
+  SELECT COALESCE(SUM(GREATEST(q.qty, 0) * COALESCE(NULLIF(p.standard_cost,0), p.distributor_price, 0)),0) val
+  FROM (
+    SELECT product_id, SUM(qty) qty FROM (
+      SELECT product_id, quantity qty FROM stock_levels
+      UNION ALL
+      SELECT product_id, -quantity FROM stock_movements WHERE created_at::date > $1::date
+    ) m GROUP BY product_id
+  ) q JOIN products p ON p.id = q.product_id`;
+
 /**
  * Build the full financial statement set for a period.
  * @returns {{meta:object, profitLoss:object, balanceSheet:object}}
  */
-export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = true } = {}) {
+export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = true, withTxns = true } = {}) {
+  for (const d of [fromDate, toDate]) {
+    if (d && !/^\d{4}-\d{2}-\d{2}$/.test(d)) throw Object.assign(new Error(`Invalid date "${d}" — use YYYY-MM-DD`), { statusCode: 400 });
+  }
   const period = resolvePeriod(reportType, fromDate, toDate);
-  const { from, to } = period;
+  // Presets end on the "As on" date (toDate, else today), not the future period end —
+  // a Balance Sheet is as at a date and a YTD P&L stops today (Tally behaviour).
+  const asOn = toDate || new Date(Date.now() - new Date().getTimezoneOffset() * 60_000).toISOString().slice(0, 10);
+  const from = period.from;
+  const to = period.reportType !== 'CUSTOM' && period.to > asOn ? asOn : period.to;
+  if (from > to) throw Object.assign(new Error('From date cannot be after the To date'), { statusCode: 400 });
   const g = !!gstOnly;
+  const none = { rows: [] };
 
   const [
     company,
     salesRow,
+    directSalesRow,
+    notesRow,
     salesRetRow,
     purchRow,
     purchRetRow,
@@ -63,6 +90,23 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
        WHERE status <> 'CANCELLED' AND invoice_date BETWEEN $1 AND $2 AND (NOT $3 OR bill_type = 'GST')`,
       [from, to, g],
     ),
+    // Direct (counter) party sales — real sales that never get an invoices row.
+    query(
+      `SELECT COALESCE(SUM(sub_total),0) taxable, COALESCE(SUM(tax_total),0) gst
+       FROM party_sales WHERE sale_date BETWEEN $1 AND $2 AND (NOT $3 OR tax_total > 0)`,
+      [from, to, g],
+    ),
+    // Manual credit/debit notes (discounts, rate corrections…). Notes raised by an
+    // approved sales return are excluded here — sales_returns already nets those off.
+    query(
+      `SELECT COALESCE(SUM(sgn * COALESCE(taxable_value, amount)),0) taxable,
+              COALESCE(SUM(sgn * (COALESCE(cgst,0) + COALESCE(sgst,0) + COALESCE(igst,0))),0) gst
+       FROM (SELECT n.*, CASE WHEN n.note_type = 'CREDIT' THEN -1 ELSE 1 END sgn
+             FROM credit_debit_notes n
+             WHERE n.created_at::date BETWEEN $1 AND $2
+               AND NOT EXISTS (SELECT 1 FROM sales_returns sr WHERE sr.credit_note_no = n.note_no)) x`,
+      [from, to],
+    ),
     query(
       `SELECT COALESCE(SUM(sr.sub_total),0) sub, COALESCE(SUM(sr.tax_total),0) tax
        FROM sales_returns sr LEFT JOIN orders o ON o.id = sr.order_id
@@ -81,40 +125,52 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
        FROM purchase_returns WHERE status = 'APPROVED' AND return_date BETWEEN $1 AND $2`,
       [from, to],
     ),
-    // Closing stock = current on-hand quantity × unit cost (standard_cost, else distributor_price).
-    query(
-      `SELECT COALESCE(SUM(sl.quantity * COALESCE(NULLIF(p.standard_cost,0), p.distributor_price, 0)),0) val
-       FROM stock_levels sl JOIN products p ON p.id = sl.product_id`,
-    ),
-    // Opening stock — manual OPENING_STOCK entry as of period start (preferred).
+    // Closing stock AS AT period end = on-hand today − movements after `to`, × unit cost.
+    query(STOCK_AS_AT, [to]),
+    // Opening stock — a manual OPENING_STOCK entry dated on/just before the period start (preferred).
+    // ponytail: only a snapshot at the period boundary counts; older ones would be stale for this period.
     query(
       `SELECT COALESCE(SUM(amount),0) val FROM financial_ledger_entries
-       WHERE section = 'OPENING_STOCK' AND entry_date <= $1`,
+       WHERE section = 'OPENING_STOCK' AND entry_date BETWEEN $1::date - 1 AND $1::date`,
       [from],
     ),
-    // Opening stock fallback — valuation of net stock movements before the period.
+    // Opening stock fallback — stock as at the day before the period starts (same basis as closing).
+    query(STOCK_AS_AT, [prevDay(from)]),
+    // Receivables / advances by customer as on period end — same open items as the
+    // Aging report: open invoices + open direct sales ± credit/debit notes − on-account receipts.
     query(
-      `SELECT COALESCE(SUM(q.qty * COALESCE(NULLIF(p.standard_cost,0), p.distributor_price, 0)),0) val
-       FROM (SELECT product_id, SUM(quantity) qty FROM stock_movements WHERE created_at::date < $1 GROUP BY product_id) q
-       JOIN products p ON p.id = q.product_id WHERE q.qty > 0`,
-      [from],
-    ),
-    // Receivables / advances by customer, as on period end (point-in-time).
-    query(
-      `SELECT COALESCE(d.name, f.name, 'Unknown') name, SUM(i.total_amount - i.amount_paid) bal
-       FROM invoices i
-       LEFT JOIN distributors d ON d.id = i.distributor_id
-       LEFT JOIN farmers f ON f.id = i.farmer_id
-       WHERE i.status <> 'CANCELLED' AND i.invoice_date <= $1 AND (NOT $2 OR i.bill_type = 'GST')
-       GROUP BY COALESCE(d.name, f.name, 'Unknown')`,
+      `SELECT name, SUM(amt) bal FROM (
+         SELECT COALESCE(d.name, f.name, 'Unknown') name, i.total_amount - i.amount_paid amt
+         FROM invoices i LEFT JOIN distributors d ON d.id = i.distributor_id LEFT JOIN farmers f ON f.id = i.farmer_id
+         WHERE i.status <> 'CANCELLED' AND i.invoice_date <= $1 AND (NOT $2 OR i.bill_type = 'GST')
+         UNION ALL
+         SELECT COALESCE(d.name, f.name, 'Unknown'), s.total_amount - s.amount_paid
+         FROM party_sales s LEFT JOIN distributors d ON d.id = s.distributor_id LEFT JOIN farmers f ON f.id = s.farmer_id
+         WHERE s.sale_date <= $1 AND (NOT $2 OR s.tax_total > 0)
+         UNION ALL
+         SELECT COALESCE(d.name, 'Unknown'), CASE WHEN n.note_type = 'CREDIT' THEN -n.amount ELSE n.amount END
+         FROM credit_debit_notes n LEFT JOIN distributors d ON d.id = n.distributor_id
+         WHERE n.created_at::date <= $1
+         UNION ALL
+         SELECT COALESCE(d.name, f.name, 'Unknown'), -p.amount
+         FROM payments p LEFT JOIN distributors d ON d.id = p.distributor_id LEFT JOIN farmers f ON f.id = p.farmer_id
+         WHERE p.invoice_id IS NULL AND p.paid_at::date <= $1
+       ) x GROUP BY name`,
       [to, g],
     ),
-    // Payables by vendor, as on period end.
+    // Payables by vendor as on period end: open bills − on-account payments − approved purchase returns.
     query(
-      `SELECT v.name, SUM(pi.total_amount - pi.amount_paid) bal
-       FROM purchase_invoices pi JOIN vendors v ON v.id = pi.vendor_id
-       WHERE pi.invoice_date <= $1 AND (NOT $2 OR pi.tax_value > 0)
-       GROUP BY v.name HAVING SUM(pi.total_amount - pi.amount_paid) > 0 ORDER BY bal DESC`,
+      `SELECT name, SUM(amt) bal FROM (
+         SELECT v.name, pi.total_amount - pi.amount_paid amt
+         FROM purchase_invoices pi JOIN vendors v ON v.id = pi.vendor_id
+         WHERE pi.invoice_date <= $1 AND (NOT $2 OR pi.tax_value > 0)
+         UNION ALL
+         SELECT v.name, -vp.amount FROM vendor_payments vp JOIN vendors v ON v.id = vp.vendor_id
+         WHERE vp.purchase_invoice_id IS NULL AND vp.paid_at::date <= $1
+         UNION ALL
+         SELECT v.name, -pr.total_amount FROM purchase_returns pr JOIN vendors v ON v.id = pr.vendor_id
+         WHERE pr.status = 'APPROVED' AND COALESCE(pr.approved_at::date, pr.return_date) <= $1
+       ) x GROUP BY name ORDER BY bal DESC`,
       [to, g],
     ),
     // Manual adjustments up to period end (PL/TRADING rows are date-filtered in JS).
@@ -125,7 +181,7 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
       [to, g],
     ),
     // All sales transactions in the period — same source as the Trading "By Sales" figure.
-    query(
+    !withTxns ? none : query(
       `SELECT i.invoice_no AS ref, i.invoice_date AS dt, COALESCE(d.name, f.name, 'Unknown') AS party,
               i.taxable_value AS taxable, i.total_amount AS total
        FROM invoices i
@@ -136,7 +192,7 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
       [from, to, g],
     ),
     // All purchase transactions in the period — same source as the Trading "Purchases" figure.
-    query(
+    !withTxns ? none : query(
       `SELECT COALESCE(pi.bill_no, pi.internal_no) AS ref, pi.invoice_date AS dt, v.name AS party,
               pi.taxable_value AS taxable, pi.total_amount AS total
        FROM purchase_invoices pi JOIN vendors v ON v.id = pi.vendor_id
@@ -147,11 +203,11 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
   ]);
 
   // ── Derived commerce figures ────────────────────────────────
-  const salesNet = r2(num(salesRow.rows[0].taxable) - num(salesRetRow.rows[0].sub));
+  const salesNet = r2(num(salesRow.rows[0].taxable) + num(directSalesRow.rows[0].taxable) + num(notesRow.rows[0].taxable) - num(salesRetRow.rows[0].sub));
   const purchasesNet = r2(num(purchRow.rows[0].taxable) - num(purchRetRow.rows[0].sub));
   const closingStock = r2(num(closingStockRow.rows[0].val));
   const openingStock = r2(num(openingManualRow.rows[0].val) || num(openingMoveRow.rows[0].val));
-  const outputGst = r2(num(salesRow.rows[0].gst) - num(salesRetRow.rows[0].tax));
+  const outputGst = r2(num(salesRow.rows[0].gst) + num(directSalesRow.rows[0].gst) + num(notesRow.rows[0].gst) - num(salesRetRow.rows[0].tax));
   const inputGst = r2(num(purchRow.rows[0].gst) - num(purchRetRow.rows[0].tax));
   const netGst = r2(outputGst - inputGst); // > 0 ⇒ payable, < 0 ⇒ receivable
 
@@ -163,7 +219,8 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
 
   const debtors = debtorRows.rows.filter((r) => num(r.bal) > 0).map((r) => ({ name: r.name, amount: r2(num(r.bal)) })).sort((a, b) => b.amount - a.amount);
   const advances = debtorRows.rows.filter((r) => num(r.bal) < 0).map((r) => ({ name: r.name, amount: r2(-num(r.bal)) })).sort((a, b) => b.amount - a.amount);
-  const creditors = creditorRows.rows.map((r) => ({ name: r.name, amount: r2(num(r.bal)) }));
+  const creditors = creditorRows.rows.filter((r) => num(r.bal) > 0).map((r) => ({ name: r.name, amount: r2(num(r.bal)) }));
+  const supplierAdvancesTotal = r2(-creditorRows.rows.filter((r) => num(r.bal) < 0).reduce((s, r) => s + num(r.bal), 0));
   const debtorsTotal = sumAmt(debtors);
   const advancesTotal = sumAmt(advances);
   const creditorsTotal = sumAmt(creditors);
@@ -275,6 +332,7 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
   const currentAssets = [];
   if (closingStock) currentAssets.push({ label: 'Closing Stock', amount: closingStock });
   if (debtorsTotal) currentAssets.push({ label: 'Sundry Debtors', amount: debtorsTotal });
+  if (supplierAdvancesTotal) currentAssets.push({ label: 'Advance to Suppliers', amount: supplierAdvancesTotal });
   for (const l of toLines(bsMan.CASH)) currentAssets.push(l);
   for (const l of toLines(bsMan.BANK)) currentAssets.push(l);
   for (const l of toLines(bsMan.LOAN_ADVANCE)) currentAssets.push(l);
@@ -285,9 +343,14 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
   // Profit & Loss A/c on the Assets side when it is a debit (accumulated loss).
   if (plBalance < 0) assets.push(grp('Profit & Loss A/c', -plBalance, plAccountLines, true));
 
-  const liabilitiesTotal = r2(liabilities.reduce((s, x) => s + x.amount, 0));
-  const assetsTotal = r2(assets.reduce((s, x) => s + x.amount, 0));
-  const difference = r2(assetsTotal - liabilitiesTotal);
+  // Tally convention: an unexplained gap is printed as "Difference in Opening Balances"
+  // on the short side so both columns total the same; `validation` keeps the raw figures.
+  const rawLiabilities = r2(liabilities.reduce((s, x) => s + x.amount, 0));
+  const rawAssets = r2(assets.reduce((s, x) => s + x.amount, 0));
+  const difference = r2(rawAssets - rawLiabilities);
+  if (Math.abs(difference) >= 0.01) (difference > 0 ? liabilities : assets).push(grp(DIFF_LABEL, Math.abs(difference)));
+  const liabilitiesTotal = Math.max(rawLiabilities, rawAssets);
+  const assetsTotal = liabilitiesTotal;
 
   const c = company.rows[0] || {};
   const meta = {
@@ -303,7 +366,7 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
     from,
     to,
     gstOnly: g,
-    stockBasis: 'Closing stock = current on-hand quantity × unit cost (standard cost, else distributor price).',
+    stockBasis: 'Stock is valued as at the period dates (on-hand quantity less later movements) × unit cost (standard cost, else distributor price).',
     generatedAt: new Date().toISOString(),
     notes: noteEntry?.meta ?? null,
   };
@@ -335,8 +398,8 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
         purchases: purchaseTxns,
       },
       validation: {
-        assetsTotal,
-        liabilitiesTotal,
+        assetsTotal: rawAssets,
+        liabilitiesTotal: rawLiabilities,
         difference,
         balanced: Math.abs(difference) < 0.01,
       },
@@ -346,7 +409,7 @@ export async function buildFinancials({ reportType, fromDate, toDate, gstOnly = 
 
 /** Convenience wrapper returning just the Profit & Loss slice (+meta). */
 export async function buildProfitLoss(opts) {
-  const f = await buildFinancials(opts);
+  const f = await buildFinancials({ ...opts, withTxns: false });
   return f.profitLoss;
 }
 

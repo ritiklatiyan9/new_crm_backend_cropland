@@ -406,6 +406,7 @@ CREATE TABLE IF NOT EXISTS order_lines (
   product_name  TEXT NOT NULL,                  -- snapshot at order time
   hsn_code      TEXT,
   uom           TEXT,
+  packing_size  TEXT,
   quantity      NUMERIC(14,2) NOT NULL CHECK (quantity > 0),
   unit_price    NUMERIC(12,2) NOT NULL,
   discount_pct  NUMERIC(5,2) NOT NULL DEFAULT 0,
@@ -1124,6 +1125,9 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_weight      TEXT;          -- 
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS freight_charges   NUMERIC(14,2);
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS freight_type      TEXT;          -- PAID / TO_PAY
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS dispatch_through  TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_note     TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_note_date DATE;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS dispatch_doc_no   TEXT;
 
 -- Buyer billing-address snapshot, frozen at order/bill generation. Historical bills
 -- keep the address used at the time even if the party master is edited later.
@@ -1410,6 +1414,12 @@ ALTER TABLE distributors ADD COLUMN IF NOT EXISTS msme_type         TEXT;
 ALTER TABLE distributors ADD COLUMN IF NOT EXISTS msme_registered   BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE distributors ADD COLUMN IF NOT EXISTS msme_reg_date     DATE;
 
+-- Tally-style buyer master details used by the bill address and tax identity.
+ALTER TABLE distributors ADD COLUMN IF NOT EXISTS country TEXT DEFAULT 'India';
+ALTER TABLE distributors ADD COLUMN IF NOT EXISTS pincode TEXT;
+ALTER TABLE distributors ADD COLUMN IF NOT EXISTS pan TEXT;
+ALTER TABLE distributors ADD COLUMN IF NOT EXISTS registration_type TEXT DEFAULT 'Regular';
+
 -- ─────────────────────────────────────────────────────────────
 -- GST PARITY UPGRADE — exact tax capture + smart reconciliation (roadmap P0.2/P0.3/P2.1).
 -- ─────────────────────────────────────────────────────────────
@@ -1460,3 +1470,210 @@ ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS gst_api_enabled   BOOLEAN 
 --                + GST parity upgrade: exact tax capture + smart reconciliation
 --                + GST API / GSP integration credentials)
 -- ============================================================================
+
+-- ─────────────────────────────────────────────────────────────
+-- PACK-SIZE SNAPSHOT on document lines (2026-09-27).
+-- Products are sold in packs (products.packing_size e.g. '250ml'); line
+-- quantity counts packs. Snapshot the pack size so invoices print
+-- "40 × 250 ml" (not "40 L") and GST HSN quantities convert correctly
+-- (see src/services/units.js statutoryQty). Backfill only fills NULLs.
+-- ─────────────────────────────────────────────────────────────
+ALTER TABLE order_lines            ADD COLUMN IF NOT EXISTS packing_size TEXT;
+ALTER TABLE party_sale_lines       ADD COLUMN IF NOT EXISTS packing_size TEXT;
+ALTER TABLE distributor_sale_lines ADD COLUMN IF NOT EXISTS packing_size TEXT;
+ALTER TABLE sales_return_lines     ADD COLUMN IF NOT EXISTS packing_size TEXT;
+ALTER TABLE purchase_order_lines   ADD COLUMN IF NOT EXISTS packing_size TEXT;
+ALTER TABLE purchase_return_lines  ADD COLUMN IF NOT EXISTS packing_size TEXT;
+UPDATE order_lines x SET packing_size = p.packing_size FROM products p
+ WHERE x.packing_size IS NULL AND p.id = x.product_id AND p.packing_size IS NOT NULL;
+UPDATE party_sale_lines x SET packing_size = p.packing_size FROM products p
+ WHERE x.packing_size IS NULL AND p.id = x.product_id AND p.packing_size IS NOT NULL;
+UPDATE distributor_sale_lines x SET packing_size = p.packing_size FROM products p
+ WHERE x.packing_size IS NULL AND p.id = x.product_id AND p.packing_size IS NOT NULL;
+UPDATE sales_return_lines x SET packing_size = p.packing_size FROM products p
+ WHERE x.packing_size IS NULL AND p.id = x.product_id AND p.packing_size IS NOT NULL;
+UPDATE purchase_order_lines x SET packing_size = p.packing_size FROM products p
+ WHERE x.packing_size IS NULL AND p.id = x.product_id AND p.packing_size IS NOT NULL;
+UPDATE purchase_return_lines x SET packing_size = p.packing_size FROM products p
+ WHERE x.packing_size IS NULL AND p.id = x.product_id AND p.packing_size IS NOT NULL;
+
+-- ─────────────────────────────────────────────────────────────
+-- SALES-BILLING (2026-09-27): indexes for order-to-cash lookups/joins.
+-- ─────────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_invoices_order ON invoices(order_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_farmer ON invoices(farmer_id);
+CREATE INDEX IF NOT EXISTS idx_payments_invoice ON payments(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_payments_farmer ON payments(farmer_id);
+CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_date ON orders(order_date DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_movements_ref ON stock_movements(ref_type, ref_id);
+CREATE INDEX IF NOT EXISTS idx_loyalty_ref_order ON loyalty_transactions(ref_order_id);
+CREATE INDEX IF NOT EXISTS idx_distsale_farmer ON distributor_sales(farmer_id);
+
+-- FINANCE (2026-09-27) — period filters on statements / aging / GST notes.
+CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(invoice_date);
+CREATE INDEX IF NOT EXISTS idx_pinv_date ON purchase_invoices(invoice_date);
+CREATE INDEX IF NOT EXISTS idx_notes_created ON credit_debit_notes(created_at);
+
+-- AI-ADVISORY (2026-09-27) — lead-per-diagnosis lookups (hasLead / createLeadFromDiagnosis) and status-filtered advisory lists.
+CREATE INDEX IF NOT EXISTS idx_leads_diagnosis ON crm_leads(diagnosis_id);
+CREATE INDEX IF NOT EXISTS idx_advisory_status ON advisories(status, created_at DESC);
+
+-- ─────────────────────────────────────────────────────────────
+-- PERFORMANCE INDEXES (platform) — FK columns the resolvers filter on
+-- that had no leading index (farmer app history, returnable-qty lookups,
+-- PO → GRN / bill / return, stock ledger newest-first).
+-- ─────────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_diag_farmer ON crop_diagnoses(farmer_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_advisory_farmer ON advisories(farmer_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_enquiry_farmer ON purchase_enquiries(farmer_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_leads_farmer ON crm_leads(farmer_id);
+CREATE INDEX IF NOT EXISTS idx_sret_order ON sales_returns(order_id);
+CREATE INDEX IF NOT EXISTS idx_pret_po ON purchase_returns(po_id);
+CREATE INDEX IF NOT EXISTS idx_grn_po ON goods_receipts(po_id);
+CREATE INDEX IF NOT EXISTS idx_pinv_po ON purchase_invoices(po_id);
+CREATE INDEX IF NOT EXISTS idx_movements_created ON stock_movements(created_at DESC);
+
+-- ─────────────────────────────────────────────────────────────
+-- ACCOUNTING (2026-09-27) — double-entry books of accounts (Tally parity).
+-- Chart of accounts (acc_groups → acc_ledgers) + manual vouchers. Postings for
+-- commerce documents are DERIVED at read time (src/services/accounting/postings.js),
+-- never stored. Party ledgers are virtual (distributors / farmers / vendors); an
+-- acc_ledgers row linked by (party_type, party_id) only overrides group/opening.
+-- Ledger key used by voucher lines: system code (CASH…) | acc_ledgers.id | 'VENDOR:<uuid>'.
+-- See architecture/ACCOUNTING.md.
+-- ─────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS acc_groups (
+  id                   TEXT PRIMARY KEY,               -- stable code, e.g. SUNDRY_DEBTORS
+  name                 TEXT NOT NULL UNIQUE,
+  parent_id            TEXT REFERENCES acc_groups(id),
+  nature               TEXT NOT NULL CHECK (nature IN ('ASSET','LIABILITY','INCOME','EXPENSE')),
+  affects_gross_profit BOOLEAN NOT NULL DEFAULT FALSE,
+  sort_order           INT NOT NULL DEFAULT 0
+);
+INSERT INTO acc_groups (id, name, parent_id, nature, affects_gross_profit, sort_order) VALUES
+  ('CAPITAL','Capital Account',NULL,'LIABILITY',FALSE,10),
+  ('RESERVES','Reserves & Surplus','CAPITAL','LIABILITY',FALSE,11),
+  ('LOANS_LIAB','Loans (Liability)',NULL,'LIABILITY',FALSE,20),
+  ('SECURED_LOANS','Secured Loans','LOANS_LIAB','LIABILITY',FALSE,21),
+  ('UNSECURED_LOANS','Unsecured Loans','LOANS_LIAB','LIABILITY',FALSE,22),
+  ('BANK_OD','Bank OD A/c','LOANS_LIAB','LIABILITY',FALSE,23),
+  ('CURRENT_LIAB','Current Liabilities',NULL,'LIABILITY',FALSE,30),
+  ('DUTIES_TAXES','Duties & Taxes','CURRENT_LIAB','LIABILITY',FALSE,31),
+  ('PROVISIONS','Provisions','CURRENT_LIAB','LIABILITY',FALSE,32),
+  ('SUNDRY_CREDITORS','Sundry Creditors','CURRENT_LIAB','LIABILITY',FALSE,33),
+  ('SUSPENSE','Suspense A/c',NULL,'LIABILITY',FALSE,40),
+  ('FIXED_ASSETS','Fixed Assets',NULL,'ASSET',FALSE,50),
+  ('INVESTMENTS','Investments',NULL,'ASSET',FALSE,60),
+  ('CURRENT_ASSETS','Current Assets',NULL,'ASSET',FALSE,70),
+  ('BANK_ACCOUNTS','Bank Accounts','CURRENT_ASSETS','ASSET',FALSE,71),
+  ('CASH_IN_HAND','Cash-in-Hand','CURRENT_ASSETS','ASSET',FALSE,72),
+  ('DEPOSITS','Deposits (Asset)','CURRENT_ASSETS','ASSET',FALSE,73),
+  ('LOANS_ADV','Loans & Advances (Asset)','CURRENT_ASSETS','ASSET',FALSE,74),
+  ('STOCK_IN_HAND','Stock-in-Hand','CURRENT_ASSETS','ASSET',FALSE,75),
+  ('SUNDRY_DEBTORS','Sundry Debtors','CURRENT_ASSETS','ASSET',FALSE,76),
+  ('MISC_EXP','Misc. Expenses (Asset)',NULL,'ASSET',FALSE,80),
+  ('SALES','Sales Accounts',NULL,'INCOME',TRUE,90),
+  ('PURCHASES','Purchase Accounts',NULL,'EXPENSE',TRUE,100),
+  ('DIRECT_INCOMES','Direct Incomes',NULL,'INCOME',TRUE,110),
+  ('DIRECT_EXPENSES','Direct Expenses',NULL,'EXPENSE',TRUE,120),
+  ('INDIRECT_INCOMES','Indirect Incomes',NULL,'INCOME',FALSE,130),
+  ('INDIRECT_EXPENSES','Indirect Expenses',NULL,'EXPENSE',FALSE,140)
+ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS acc_ledgers (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  code            TEXT UNIQUE,                          -- system ledger code; NULL for user ledgers
+  name            TEXT NOT NULL,
+  group_id        TEXT NOT NULL REFERENCES acc_groups(id),
+  opening_balance NUMERIC(14,2) NOT NULL DEFAULT 0,     -- signed + Dr / − Cr, at books beginning
+  party_type      TEXT CHECK (party_type IN ('DISTRIBUTOR','FARMER','VENDOR')),
+  party_id        UUID,
+  gstin           TEXT,
+  state           TEXT,
+  is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+  created_by      UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK ((party_type IS NULL) = (party_id IS NULL)),
+  UNIQUE (party_type, party_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_acc_ledgers_name ON acc_ledgers (lower(name)) WHERE party_type IS NULL;
+INSERT INTO acc_ledgers (code, name, group_id) VALUES
+  ('CASH','Cash','CASH_IN_HAND'),
+  ('BANK','Bank Account','BANK_ACCOUNTS'),
+  ('CAPITAL','Capital','CAPITAL'),
+  ('SALES_GST','Sales - GST','SALES'),
+  ('SALES_NONGST','Sales - Non-GST','SALES'),
+  ('SALES_RETURNS','Sales Returns','SALES'),
+  ('PURCHASE','Purchase','PURCHASES'),
+  ('PURCHASE_RETURNS','Purchase Returns','PURCHASES'),
+  ('OUTPUT_CGST','Output CGST','DUTIES_TAXES'),
+  ('OUTPUT_SGST','Output SGST','DUTIES_TAXES'),
+  ('OUTPUT_IGST','Output IGST','DUTIES_TAXES'),
+  ('INPUT_CGST','Input CGST','DUTIES_TAXES'),
+  ('INPUT_SGST','Input SGST','DUTIES_TAXES'),
+  ('INPUT_IGST','Input IGST','DUTIES_TAXES'),
+  ('RCM_PAYABLE','GST Payable (Reverse Charge)','DUTIES_TAXES'),
+  ('ROUND_OFF','Round Off','INDIRECT_EXPENSES'),
+  ('DISCOUNT','Discount Allowed','INDIRECT_EXPENSES'),
+  ('FREIGHT','Freight Charges','DIRECT_EXPENSES'),
+  ('SUSPENSE','Suspense','SUSPENSE')
+ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS acc_vouchers (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  voucher_type  TEXT NOT NULL CHECK (voucher_type IN ('PAYMENT','RECEIPT','CONTRA','JOURNAL','SALES','PURCHASE','CREDIT_NOTE','DEBIT_NOTE')),
+  fy            TEXT NOT NULL,                          -- Indian FY, e.g. 2026-27
+  seq           INT NOT NULL,
+  voucher_no    TEXT NOT NULL,
+  voucher_date  DATE NOT NULL,
+  ref_no        TEXT,
+  narration     TEXT,
+  amount        NUMERIC(14,2) NOT NULL DEFAULT 0,       -- Σ Dr (= Σ Cr)
+  status        TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','CANCELLED')),
+  cancel_reason TEXT,
+  cancelled_by  UUID REFERENCES users(id) ON DELETE SET NULL,
+  cancelled_at  TIMESTAMPTZ,
+  created_by    UUID REFERENCES users(id) ON DELETE SET NULL,
+  updated_by    UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (voucher_type, fy, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_acc_vouchers_date ON acc_vouchers(voucher_date);
+
+CREATE TABLE IF NOT EXISTS acc_voucher_lines (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  voucher_id  UUID NOT NULL REFERENCES acc_vouchers(id) ON DELETE CASCADE,
+  line_no     INT NOT NULL,
+  ledger_key  TEXT NOT NULL,
+  dr          NUMERIC(14,2) NOT NULL DEFAULT 0 CHECK (dr >= 0),
+  cr          NUMERIC(14,2) NOT NULL DEFAULT 0 CHECK (cr >= 0),
+  narration   TEXT,
+  CHECK ((dr > 0) <> (cr > 0))
+);
+CREATE INDEX IF NOT EXISTS idx_acc_vlines_voucher ON acc_voucher_lines(voucher_id);
+CREATE INDEX IF NOT EXISTS idx_acc_vlines_ledger ON acc_voucher_lines(ledger_key);
+
+CREATE TABLE IF NOT EXISTS acc_voucher_counters (
+  voucher_type TEXT NOT NULL,
+  fy           TEXT NOT NULL,
+  last_seq     INT NOT NULL DEFAULT 0,
+  PRIMARY KEY (voucher_type, fy)
+);
+
+CREATE TABLE IF NOT EXISTS acc_settings (
+  id              INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  books_lock_date DATE,                                 -- manual vouchers dated on/before are frozen
+  updated_by      UUID REFERENCES users(id) ON DELETE SET NULL,
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO acc_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+-- Source-date indexes for the period-bounded posting derivation.
+CREATE INDEX IF NOT EXISTS idx_payments_paid_at ON payments(paid_at);
+CREATE INDEX IF NOT EXISTS idx_vpay_paid_at ON vendor_payments(paid_at);
+CREATE INDEX IF NOT EXISTS idx_psale_date ON party_sales(sale_date);
+CREATE INDEX IF NOT EXISTS idx_sret_status_date ON sales_returns(status, return_date);
+CREATE INDEX IF NOT EXISTS idx_pret_status_date ON purchase_returns(status, return_date);

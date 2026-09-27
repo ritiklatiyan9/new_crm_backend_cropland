@@ -72,6 +72,7 @@ export async function upsertSample(id, vector, metadata = {}) {
     // Pinecone metadata rejects null/undefined values — strip them.
     const meta = Object.fromEntries(Object.entries(metadata).filter(([, v]) => v != null && v !== ''));
     await index.upsert({ records: [{ id: String(id), values: vector, metadata: meta }] });
+    invalidateVectorStoreStatus();
     return true;
   } catch (err) {
     console.error('[pinecone] upsert failed:', err.message);
@@ -86,6 +87,7 @@ export async function deleteSamples(ids) {
   try {
     const index = await getIndex();
     await index.deleteMany({ ids: list });
+    invalidateVectorStoreStatus();
     return true;
   } catch (err) {
     console.error('[pinecone] delete failed:', err.message);
@@ -111,8 +113,28 @@ export async function querySimilar(vector, { crop, topK = 4 } = {}) {
   }
 }
 
-/** Index health/stats for the Train AI Doctor status panel. */
+// Pinecone stats are 0.5-4 s network round-trips; cache them so the Train AI
+// Doctor page doesn't wait on Pinecone. Stale values are served while a refresh runs.
+const STATUS_TTL_MS = 5 * 60_000;
+let statusCache = null; // { at, value, pending }
+
+/** Index health/stats for the Train AI Doctor status panel (cached, stale-while-revalidate). */
 export async function vectorStoreStatus() {
+  const now = Date.now();
+  if (statusCache?.value && now - statusCache.at < STATUS_TTL_MS) return statusCache.value;
+  if (!statusCache?.pending) {
+    const pending = fetchVectorStoreStatus()
+      .then((value) => { statusCache = { at: Date.now(), value }; return value; })
+      .finally(() => { if (statusCache?.pending === pending) statusCache.pending = null; });
+    statusCache = { ...(statusCache ?? { at: 0 }), pending };
+  }
+  return statusCache.value ?? statusCache.pending;
+}
+
+/** Drop the cached stats (after upserts/deletes so vector counts refresh). */
+function invalidateVectorStoreStatus() { if (statusCache) statusCache.at = 0; }
+
+async function fetchVectorStoreStatus() {
   const base = {
     provider: 'pinecone',
     configured: pineconeConfigured,
@@ -132,3 +154,6 @@ export async function vectorStoreStatus() {
     return { ...base, ready: false, error: err.message };
   }
 }
+
+// Warm the status cache at boot so the first page load doesn't pay for Pinecone.
+if (pineconeConfigured) vectorStoreStatus().catch(() => {});

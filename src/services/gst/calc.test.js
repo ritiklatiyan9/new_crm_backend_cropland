@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   roundGst, splitTax, gstr1Bucket, B2CL_THRESHOLD, computeCdnTax,
-  normDocNo, matchKey, similarity, classifyPair, netLiability, interest88B, lateFee, within,
+  normDocNo, matchKey, similarity, classifyPair, netLiability, interest88B, lateFee, within, utiliseItc, ewbValidUntil,
 } from './calc.js';
 
 test('roundGst: half-up to 2 decimals', () => {
@@ -100,4 +100,24 @@ test('lateFee: 50/day normal, 20/day nil, capped', () => {
   assert.equal(lateFee(10), 500);
   assert.equal(lateFee(10, true), 200);
   assert.equal(lateFee(1000), 5000); // cap
+});
+
+test('lateFee: nil return capped at 500', () => {
+  assert.equal(lateFee(100, true), 500);
+});
+
+test('utiliseItc: IGST credit spills to CGST/SGST; CGST/SGST credit offsets IGST', () => {
+  // Output IGST 900 only, credit CGST/SGST 18,153 each → CGST credit clears IGST.
+  assert.deepEqual(utiliseItc({ igst: 900, cgst: 0, sgst: 0 }, { igst: 0, cgst: 18153, sgst: 18153 }), { igst: 0, cgst: 0, sgst: 0 });
+  // IGST credit 1500 vs output IGST 1000, CGST 400, SGST 400 → 500 left: CGST 400 then SGST 100.
+  assert.deepEqual(utiliseItc({ igst: 1000, cgst: 400, sgst: 400 }, { igst: 1500, cgst: 0, sgst: 0 }), { igst: 0, cgst: 0, sgst: 300 });
+  // CGST credit never offsets SGST.
+  assert.deepEqual(utiliseItc({ igst: 0, cgst: 100, sgst: 100 }, { igst: 0, cgst: 500, sgst: 0 }), { igst: 0, cgst: 0, sgst: 100 });
+});
+
+test('ewbValidUntil: 1 day per 200 km, ends midnight IST of the following day', () => {
+  const gen = '2026-06-10T04:30:00Z'; // 10 Jun 10:00 IST
+  assert.equal(ewbValidUntil(gen, 150).toISOString(), '2026-06-11T18:29:59.000Z'); // 11 Jun 23:59:59 IST
+  assert.equal(ewbValidUntil(gen, 201).toISOString(), '2026-06-12T18:29:59.000Z');
+  assert.equal(ewbValidUntil('2026-06-10T19:00:00Z', 100).toISOString(), '2026-06-12T18:29:59.000Z'); // 11 Jun 00:30 IST
 });

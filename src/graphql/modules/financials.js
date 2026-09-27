@@ -121,11 +121,13 @@ export function financialsResolvers() {
     Query: {
       profitLoss: async (_p, { reportType, fromDate, toDate, gstOnly }, ctx) => {
         guardRead(ctx);
-        return buildProfitLoss({ reportType, fromDate, toDate, gstOnly: gstOnly ?? true });
+        return buildProfitLoss({ reportType, fromDate: fromDate || null, toDate: toDate || null, gstOnly: gstOnly ?? true });
       },
-      balanceSheet: async (_p, { reportType, fromDate, toDate, gstOnly }, ctx) => {
+      balanceSheet: async (_p, { reportType, fromDate, toDate, gstOnly }, ctx, info) => {
         guardRead(ctx);
-        return buildBalanceSheet({ reportType, fromDate, toDate, gstOnly: gstOnly ?? true });
+        // The sales/purchase annexures are whole-period lists — only query them when asked for.
+        const withTxns = info.fieldNodes.some((f) => f.selectionSet?.selections.some((s) => s.name?.value === 'schedules'));
+        return buildBalanceSheet({ reportType, fromDate: fromDate || null, toDate: toDate || null, gstOnly: gstOnly ?? true, withTxns });
       },
       ledgerEntries: async (_p, { statement, section }, ctx) => {
         guardRead(ctx);
@@ -133,7 +135,7 @@ export function financialsResolvers() {
           `SELECT * FROM financial_ledger_entries
            WHERE ($1::text IS NULL OR statement = $1) AND ($2::text IS NULL OR section = $2)
            ORDER BY entry_date DESC, section, label`,
-          [statement ?? null, section ?? null],
+          [statement || null, section || null],
         );
         return rows.map(mapEntry);
       },
@@ -147,6 +149,10 @@ export function financialsResolvers() {
         if (!VALID_STATEMENTS.has(statement)) throw httpError(`Invalid statement: ${statement}`, 400);
         if (!VALID_SECTIONS.has(section)) throw httpError(`Invalid section: ${section}`, 400);
         if (!input.label?.trim()) throw httpError('Label is required', 400);
+        if (!Number.isFinite(input.amount)) throw httpError('Amount must be a number', 400);
+        const entryDate = input.entryDate || null;
+        if (entryDate && !/^\d{4}-\d{2}-\d{2}$/.test(entryDate)) throw httpError('Date must be YYYY-MM-DD', 400);
+        const notes = input.notes?.trim() || null;
 
         const meta = JSON.stringify(input.meta ?? {});
         const isGst = input.isGst ?? true;
@@ -156,7 +162,7 @@ export function financialsResolvers() {
              SET entry_date = COALESCE($2::date, entry_date), statement = $3, section = $4,
                  label = $5, amount = $6, meta = $7::jsonb, is_gst = $8, notes = $9, updated_at = now()
              WHERE id = $1 RETURNING *`,
-            [input.id, input.entryDate ?? null, statement, section, input.label.trim(), input.amount ?? 0, meta, isGst, input.notes ?? null],
+            [input.id, entryDate, statement, section, input.label.trim(), input.amount, meta, isGst, notes],
           );
           if (!rows[0]) throw httpError('Ledger entry not found', 404);
           await logActivity(actor.sub, 'UPDATE_LEDGER_ENTRY', 'financial_ledger_entry', rows[0].id, { section });
@@ -165,7 +171,7 @@ export function financialsResolvers() {
         const { rows } = await query(
           `INSERT INTO financial_ledger_entries (entry_date, statement, section, label, amount, meta, is_gst, notes, created_by)
            VALUES (COALESCE($1::date, CURRENT_DATE), $2, $3, $4, $5, $6::jsonb, $7, $8, $9) RETURNING *`,
-          [input.entryDate ?? null, statement, section, input.label.trim(), input.amount ?? 0, meta, isGst, input.notes ?? null, actor.sub],
+          [entryDate, statement, section, input.label.trim(), input.amount, meta, isGst, notes, actor.sub],
         );
         await logActivity(actor.sub, 'CREATE_LEDGER_ENTRY', 'financial_ledger_entry', rows[0].id, { section });
         return mapEntry(rows[0]);

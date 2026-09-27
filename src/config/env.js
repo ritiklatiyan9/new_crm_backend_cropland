@@ -1,9 +1,13 @@
 // Centralised, validated environment configuration.
 // Values are read once at boot so the rest of the app imports a typed object.
 
+// `npm test` (NODE_ENV=test) runs pure unit tests: placeholders instead of secrets, and a DB URL that reaches nothing.
+const TEST_DEFAULTS = { DATABASE_URL: 'postgresql://test@127.0.0.1:1/test', JWT_SECRET: 'test-secret' };
+
 function required(name) {
   const value = process.env[name];
   if (value === undefined || value === '') {
+    if (process.env.NODE_ENV === 'test' && TEST_DEFAULTS[name]) return TEST_DEFAULTS[name];
     throw new Error(`Missing required environment variable: ${name}`);
   }
   return value;
@@ -35,10 +39,14 @@ export const env = {
     connectionString: required('DATABASE_URL'),
     ssl: bool('PGSSL', false),
     poolMax: Number(optional('PG_POOL_MAX', '10')),
+    // Server-side cap per statement; also bounds how long a runaway report can hold a connection.
+    statementTimeoutMs: Number(optional('PG_STATEMENT_TIMEOUT_MS', '30000')),
+    slowQueryMs: Number(optional('PG_SLOW_QUERY_MS', '500')),
   },
 
+  // Optional: nothing reads from Redis yet, so it is only connected when REDIS_URL is set.
   redis: {
-    url: optional('REDIS_URL', 'redis://localhost:6379'),
+    url: optional('REDIS_URL', ''),
   },
 
   jwt: {

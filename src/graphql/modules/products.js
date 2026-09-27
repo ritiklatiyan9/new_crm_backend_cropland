@@ -126,6 +126,33 @@ export const mapProduct = (r) =>
     createdAt: r.created_at,
   };
 
+// Trim text, turn "" into null and reject values the DB would choke on (or silently mangle).
+function cleanInput(i) {
+  const t = (v) => (typeof v === 'string' ? v.trim() || null : v ?? null);
+  const input = { ...i };
+  for (const k of ['name', 'sku', 'technicalName', 'imageKey', 'uom', 'packingSize', 'hsnCode', 'recommendedDosage',
+    'applicationFrequency', 'safetyInstructions', 'hazardCategory', 'storageConditions']) input[k] = t(i[k]);
+  if (!input.name) throw httpError('Product name is required', 400);
+  if (!input.sku) throw httpError('SKU is required', 400);
+  if (input.uom) input.uom = input.uom.toUpperCase();
+  if (input.hsnCode) {
+    input.hsnCode = input.hsnCode.replace(/\s+/g, '');
+    if (!/^(\d{4}|\d{6}|\d{8})$/.test(input.hsnCode)) throw httpError('HSN code must be 4, 6 or 8 digits', 400);
+  }
+  if (input.gstPercent != null && !(input.gstPercent >= 0 && input.gstPercent <= 100)) throw httpError('GST % must be between 0 and 100', 400);
+  for (const [k, label] of [['mrp', 'MRP'], ['dealerPrice', 'Dealer price'], ['distributorPrice', 'Distributor price']]) {
+    if (input[k] != null && !(input[k] >= 0 && input[k] < 1e10)) throw httpError(`${label} must be 0 or more`, 400);
+  }
+  if (input.shelfLifeMonths != null && input.shelfLifeMonths < 0) throw httpError('Shelf life cannot be negative', 400);
+  return input;
+}
+
+// Case-insensitive SKU clash check (the DB UNIQUE is case-sensitive: "cs-250" vs "CS-250").
+async function assertSkuFree(sku, id = null) {
+  const { rows } = await query('SELECT name FROM products WHERE lower(sku) = lower($1) AND ($2::uuid IS NULL OR id <> $2) LIMIT 1', [sku, id]);
+  if (rows[0]) throw httpError(`SKU "${sku}" is already used by ${rows[0].name}`, 409);
+}
+
 function inputValues(input) {
   return [
     input.name,
@@ -157,13 +184,15 @@ export function productResolvers() {
     Query: {
       products: async (_p, { search, category, activeOnly, limit, offset }, ctx) => {
         assertAuth(ctx);
+        search = search?.trim() || null;
+        limit = Math.min(Math.max(limit ?? 50, 1), 1000);
         const { rows } = await query(
           `SELECT * FROM products
            WHERE ($1::text IS NULL OR name ILIKE '%' || $1 || '%' OR sku ILIKE '%' || $1 || '%' OR technical_name ILIKE '%' || $1 || '%')
              AND ($2::text IS NULL OR category = $2::product_category)
              AND ($3::bool IS FALSE OR is_active = TRUE)
            ORDER BY name ASC LIMIT $4 OFFSET $5`,
-          [search ?? null, category ?? null, activeOnly, limit, offset],
+          [search, category || null, activeOnly ?? true, limit, Math.max(offset ?? 0, 0)],
         );
         return rows.map(mapProduct);
       },
@@ -174,12 +203,10 @@ export function productResolvers() {
       },
       productStats: async (_p, _a, ctx) => {
         assertAuth(ctx);
-        const totals = await query(
-          `SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE is_active)::int AS active FROM products`,
-        );
-        const byCat = await query(
-          'SELECT category, COUNT(*)::int AS count FROM products GROUP BY category ORDER BY category',
-        );
+        const [totals, byCat] = await Promise.all([
+          query(`SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE is_active)::int AS active FROM products`),
+          query('SELECT category, COUNT(*)::int AS count FROM products GROUP BY category ORDER BY category'),
+        ]);
         return {
           total: totals.rows[0].total,
           active: totals.rows[0].active,
@@ -188,8 +215,10 @@ export function productResolvers() {
       },
     },
     Mutation: {
-      createProduct: async (_p, { input }, ctx) => {
+      createProduct: async (_p, args, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
+        const input = cleanInput(args.input);
+        await assertSkuFree(input.sku);
         let rows;
         try {
           ({ rows } = await query(
@@ -209,8 +238,10 @@ export function productResolvers() {
         await logActivity(actor.sub, 'CREATE_PRODUCT', 'product', rows[0].id, { sku: input.sku });
         return mapProduct(rows[0]);
       },
-      updateProduct: async (_p, { id, input }, ctx) => {
+      updateProduct: async (_p, { id, input: raw }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
+        const input = cleanInput(raw);
+        await assertSkuFree(input.sku, id);
         let rows;
         try {
           ({ rows } = await query(
@@ -250,6 +281,9 @@ export function productResolvers() {
       },
       updateProductPrices: async (_p, { id, mrp, dealerPrice, distributorPrice }, ctx) => {
         const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN');
+        for (const v of [mrp, dealerPrice, distributorPrice]) {
+          if (v != null && !(v >= 0 && v < 1e10)) throw httpError('Prices must be 0 or more', 400);
+        }
         const { rows } = await query(
           `UPDATE products SET
              mrp = COALESCE($2, mrp),
