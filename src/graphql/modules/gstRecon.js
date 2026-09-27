@@ -89,6 +89,7 @@ export const gstReconTypeDefs = /* GraphQL */ `
     setImsAction(docId: ID!, action: String!): ImsRow!
     bulkSetImsAction(period: String!, action: String!, onlyMatched: Boolean): Int!
     recordGstChallan(input: GstChallanInput!): GstChallan!
+    updateGstChallan(id: ID!, input: GstChallanInput!): GstChallan!
     deleteGstChallan(id: ID!): Boolean!
     setReconMatch(docId: ID!, bookInvoiceId: ID): GstReconRow!
     setReconNote(docId: ID!, note: String): Boolean!
@@ -487,8 +488,8 @@ export function gstReconResolvers() {
         }
 
         const docs = parsePortalJson(src, json);
-        const root = json?.data?.docdata || json?.data || json;
-        if (!docs.length && !('b2b' in root || 'cdnr' in root)) throw Object.assign(new Error(`No B2B invoices or credit/debit notes found — is this the ${src} JSON downloaded from gst.gov.in?`), { statusCode: 400 });
+        // Nothing parsed and no GSTIN either ⇒ not a portal download (a genuinely empty GSTR-2B still carries the GSTIN).
+        if (!docs.length && !gstin) throw Object.assign(new Error(`No B2B invoices or credit/debit notes found — is this the ${src} JSON downloaded from gst.gov.in?`), { statusCode: 400 });
         const imp = await withTransaction(async (client) => {
           const imp = (await client.query(
             `INSERT INTO gst_recon_imports (source, period, gstin, file_name, raw, line_count, uploaded_by)
@@ -558,6 +559,28 @@ export function gstReconResolvers() {
           [input.cpin || null, input.challanNo || null, input.period, input.paidDate || null, num(input.igst) || 0, num(input.cgst) || 0, num(input.sgst) || 0, num(input.cess) || 0, num(input.fees) || 0, num(input.interest) || 0, amount, input.mode || null, actor.sub],
         );
         await logActivity(actor.sub, 'RECORD_GST_CHALLAN', 'gst_challan', rows[0].id, { period: input.period, amount });
+        return mapChallan(rows[0]);
+      },
+
+      updateGstChallan: async (_p, { id, input }, ctx) => {
+        const actor = guardWrite(ctx);
+        periodRange(input.period);
+        if (input.paidDate && !/^\d{4}-\d{2}-\d{2}$/.test(input.paidDate)) throw Object.assign(new Error('Paid date must be YYYY-MM-DD'), { statusCode: 400 });
+        for (const k of ['igst', 'cgst', 'sgst', 'cess', 'fees', 'interest']) {
+          if (num(input[k]) < 0) throw Object.assign(new Error(`${k.toUpperCase()} cannot be negative`), { statusCode: 400 });
+        }
+        const amount = round2((num(input.igst) || 0) + (num(input.cgst) || 0) + (num(input.sgst) || 0) + (num(input.cess) || 0) + (num(input.fees) || 0) + (num(input.interest) || 0));
+        if (!(amount > 0)) throw Object.assign(new Error('Enter at least one amount paid'), { statusCode: 400 });
+        if (!input.challanNo?.trim() && !input.cpin?.trim()) throw Object.assign(new Error('Enter a challan number or CPIN'), { statusCode: 400 });
+        const { rows } = await query(
+          `UPDATE gst_challans SET cpin=$2, challan_no=$3, period=$4, paid_date=$5, igst=$6, cgst=$7, sgst=$8,
+            cess=$9, fees=$10, interest=$11, amount=$12, mode=$13 WHERE id=$1 RETURNING *`,
+          [id, input.cpin?.trim() || null, input.challanNo?.trim() || null, input.period, input.paidDate || null,
+            num(input.igst) || 0, num(input.cgst) || 0, num(input.sgst) || 0, num(input.cess) || 0,
+            num(input.fees) || 0, num(input.interest) || 0, amount, input.mode || null],
+        );
+        if (!rows[0]) throw Object.assign(new Error('Challan not found'), { statusCode: 404 });
+        await logActivity(actor.sub, 'UPDATE_GST_CHALLAN', 'gst_challan', id, { period: input.period, amount });
         return mapChallan(rows[0]);
       },
 

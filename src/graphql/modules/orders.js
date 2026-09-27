@@ -456,6 +456,17 @@ async function reverseLoyalty(client, orderId) {
   await client.query("DELETE FROM loyalty_transactions WHERE ref_order_id = $1 AND type = 'EARN'", [orderId]);
 }
 
+// A GST bill inside a return period already filed on the portal is frozen: GSTR-1/3B
+// already carry it, so it can only be corrected with a credit/debit note.
+async function assertGstPeriodOpen(client, inv, action) {
+  if (!inv || inv.bill_type === 'NON_GST') return;
+  const f = (await client.query(
+    "SELECT return_type FROM gst_returns WHERE status = 'FILED' AND period = to_char($1::date, 'MMYYYY') LIMIT 1",
+    [inv.invoice_date],
+  )).rows[0];
+  if (f) throw httpError(`${inv.invoice_no} is in a GST period already filed (${f.return_type}), so it cannot be ${action}. Issue a credit note instead.`, 400);
+}
+
 async function insertOrderLines(client, orderId, lines) {
   for (const { p, qty, unitPrice, disc, lineTotal, gst } of lines) {
     await client.query(
@@ -842,6 +853,7 @@ export function orderResolvers() {
           if (state && order.bill_type === 'GST') {
             const invoice = (await client.query('SELECT * FROM invoices WHERE order_id=$1 FOR UPDATE', [orderId])).rows[0];
             if (invoice?.irn || invoice?.eway_bill_no) throw httpError('Place of supply cannot change after GST e-documents are generated', 400);
+            await assertGstPeriodOpen(client, invoice, 'moved to another place of supply');
             const company = (await client.query('SELECT state FROM company_settings WHERE id=1')).rows[0];
             const interstate = order.customer_type !== 'FARMER' && Boolean(company?.state && company.state.trim().toLowerCase() !== state.toLowerCase());
             await client.query(
@@ -1097,6 +1109,7 @@ export function orderResolvers() {
           if (inv && num(inv.amount_paid) > 0) {
             throw httpError(`₹${num(inv.amount_paid).toFixed(2)} has been received against ${inv.invoice_no}. A paid bill cannot be deleted — record a sales return / credit note instead.`, 400);
           }
+          await assertGstPeriodOpen(client, inv, 'deleted');
           if (inv) {
             // 1) Put dispatched stock back: reverse the FIFO OUT movements booked at
             //    invoicing (quantity is stored negative, so subtract to add back).

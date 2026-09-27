@@ -111,15 +111,19 @@ export const returnsTypeDefs = /* GraphQL */ `
     purchaseReturns(status: String, search: String, limit: Int = 100): [PurchaseReturn!]!
     purchaseReturn(id: ID!): PurchaseReturn
     returnsStats: ReturnsStats!
-    salesReturnSource(orderId: ID!): [ReturnableLine!]!
-    purchaseReturnSource(poId: ID!): [ReturnableLine!]!
+    salesReturnSource(orderId: ID!, excludeReturnId: ID): [ReturnableLine!]!
+    purchaseReturnSource(poId: ID!, excludeReturnId: ID): [ReturnableLine!]!
   }
 
   extend type Mutation {
     createSalesReturn(input: CreateSalesReturnInput!): SalesReturn!
+    updateSalesReturn(id: ID!, input: CreateSalesReturnInput!): SalesReturn!
+    deleteSalesReturn(id: ID!): Boolean!
     approveSalesReturn(id: ID!): SalesReturn!
     cancelSalesReturn(id: ID!): SalesReturn!
     createPurchaseReturn(input: CreatePurchaseReturnInput!): PurchaseReturn!
+    updatePurchaseReturn(id: ID!, input: CreatePurchaseReturnInput!): PurchaseReturn!
+    deletePurchaseReturn(id: ID!): Boolean!
     approvePurchaseReturn(id: ID!): PurchaseReturn!
     cancelPurchaseReturn(id: ID!): PurchaseReturn!
   }
@@ -161,16 +165,16 @@ const mapPR = (r) => r && {
 };
 
 // What can still be returned against a sales order: ordered qty − qty on other (non-cancelled) returns, at the net (post-discount) price.
-async function salesSource(db, orderId) {
+async function salesSource(db, orderId, excludeReturnId = null) {
   const { rows } = await db.query(
     `SELECT ol.product_id, MIN(ol.product_name) product_name, MIN(ol.uom) uom, MIN(COALESCE(ol.packing_size, p.packing_size)) packing_size,
             SUM(ol.quantity) qty, SUM(ol.line_total) / NULLIF(SUM(ol.quantity), 0) unit_price,
             CASE WHEN MIN(o.bill_type) = 'NON_GST' THEN 0 ELSE MAX(ol.gst_percent) END gst_percent,
             COALESCE((SELECT SUM(l.quantity) FROM sales_return_lines l JOIN sales_returns r ON r.id = l.return_id
-                      WHERE r.order_id = $1 AND r.status <> 'CANCELLED' AND l.product_id = ol.product_id), 0) returned
+                      WHERE r.order_id = $1 AND r.status <> 'CANCELLED' AND ($2::uuid IS NULL OR r.id <> $2) AND l.product_id = ol.product_id), 0) returned
      FROM order_lines ol JOIN orders o ON o.id = ol.order_id LEFT JOIN products p ON p.id = ol.product_id
      WHERE ol.order_id = $1 GROUP BY ol.product_id ORDER BY MIN(ol.product_name)`,
-    [orderId],
+    [orderId, excludeReturnId],
   );
   return rows.map((r) => ({
     productId: r.product_id, productName: r.product_name, uom: r.uom, packingSize: r.packing_size, batchNumber: null,
@@ -178,16 +182,16 @@ async function salesSource(db, orderId) {
   }));
 }
 // What can still be returned against a PO: received qty − qty on other (non-cancelled) returns; batch = latest GRN batch.
-async function purchaseSource(db, poId) {
+async function purchaseSource(db, poId, excludeReturnId = null) {
   const { rows } = await db.query(
     `SELECT pl.product_id, MIN(pl.product_name) product_name, MIN(pl.uom) uom, MIN(pl.packing_size) packing_size,
             SUM(pl.received_qty) qty, SUM(pl.received_qty * pl.unit_cost) / NULLIF(SUM(pl.received_qty), 0) unit_cost, MAX(pl.gst_percent) gst_percent,
             COALESCE((SELECT SUM(l.quantity) FROM purchase_return_lines l JOIN purchase_returns r ON r.id = l.return_id
-                      WHERE r.po_id = $1 AND r.status <> 'CANCELLED' AND l.product_id = pl.product_id), 0) returned,
+                      WHERE r.po_id = $1 AND r.status <> 'CANCELLED' AND ($2::uuid IS NULL OR r.id <> $2) AND l.product_id = pl.product_id), 0) returned,
             (SELECT b.batch_number FROM stock_movements sm JOIN goods_receipts g ON g.id = sm.ref_id JOIN batches b ON b.id = sm.batch_id
               WHERE sm.ref_type = 'grn' AND g.po_id = $1 AND sm.product_id = pl.product_id ORDER BY sm.created_at DESC LIMIT 1) batch_number
      FROM purchase_order_lines pl WHERE pl.po_id = $1 GROUP BY pl.product_id ORDER BY MIN(pl.product_name)`,
-    [poId],
+    [poId, excludeReturnId],
   );
   return rows.map((r) => ({
     productId: r.product_id, productName: r.product_name, uom: r.uom, packingSize: r.packing_size, batchNumber: r.batch_number,
@@ -254,8 +258,8 @@ export function returnsResolvers() {
         return rows.map(mapPR);
       },
       purchaseReturn: async (_p, { id }, ctx) => { assertAuth(ctx); const { rows } = await query(`${PR_SELECT} WHERE pr.id=$1`, [id]); return mapPR(rows[0]); },
-      salesReturnSource: async (_p, { orderId }, ctx) => { assertAuth(ctx); return salesSource({ query }, orderId); },
-      purchaseReturnSource: async (_p, { poId }, ctx) => { assertAuth(ctx); return purchaseSource({ query }, poId); },
+      salesReturnSource: async (_p, { orderId, excludeReturnId }, ctx) => { assertAuth(ctx); return salesSource({ query }, orderId, excludeReturnId); },
+      purchaseReturnSource: async (_p, { poId, excludeReturnId }, ctx) => { assertAuth(ctx); return purchaseSource({ query }, poId, excludeReturnId); },
       returnsStats: async (_p, _a, ctx) => {
         assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
         const { rows } = await query(
@@ -306,6 +310,46 @@ export function returnsResolvers() {
           await logActivity(a.sub, 'CREATE_SALES_RETURN', 'sales_return', sr.id, { returnNo });
           return mapSR((await client.query(`${SR_SELECT} WHERE sr.id=$1`, [sr.id])).rows[0]);
         });
+      },
+
+      updateSalesReturn: async (_p, { id, input }, ctx) => {
+        const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        const orderId = str(input.orderId);
+        const result = await withTransaction(async (client) => {
+          const current = (await client.query('SELECT status FROM sales_returns WHERE id=$1 FOR UPDATE', [id])).rows[0];
+          if (!current) throw httpError('Sales return not found', 404);
+          if (current.status !== 'DRAFT') throw httpError('Only draft returns can be edited', 400);
+          if (!(await client.query('SELECT id FROM distributors WHERE id=$1', [input.distributorId])).rows[0]) throw httpError('Distributor not found', 404);
+          if (!(await client.query('SELECT id FROM warehouses WHERE id=$1', [input.warehouseId])).rows[0]) throw httpError('Warehouse not found', 404);
+          let source = null;
+          if (orderId) {
+            const order = (await client.query('SELECT distributor_id FROM orders WHERE id=$1', [orderId])).rows[0];
+            if (!order) throw httpError('Order not found', 404);
+            if (order.distributor_id !== input.distributorId) throw httpError('That order belongs to a different distributor', 400);
+            source = await salesSource(client, orderId, id);
+          }
+          const { prepared, subTotal, taxTotal } = await prepareLines(client, input.lines, 'unitPrice', source);
+          await client.query(`UPDATE sales_returns SET order_id=$2, distributor_id=$3, warehouse_id=$4, reason=$5, notes=$6,
+            sub_total=$7, tax_total=$8, total_amount=$9 WHERE id=$1`,
+            [id, orderId, input.distributorId, input.warehouseId, str(input.reason), str(input.notes), subTotal, taxTotal, round2(subTotal + taxTotal)]);
+          await client.query('DELETE FROM sales_return_lines WHERE return_id=$1', [id]);
+          for (const { l, p, gst, lineTotal } of prepared) {
+            await client.query(`INSERT INTO sales_return_lines (return_id, product_id, product_name, packing_size, batch_number, quantity, unit_price, gst_percent, line_total)
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+              [id, l.productId, p.name, p.packing_size ?? null, str(l.batchNumber), l.quantity, l.unitPrice, gst, lineTotal]);
+          }
+          return mapSR((await client.query(`${SR_SELECT} WHERE sr.id=$1`, [id])).rows[0]);
+        });
+        await logActivity(a.sub, 'UPDATE_SALES_RETURN', 'sales_return', id);
+        return result;
+      },
+
+      deleteSalesReturn: async (_p, { id }, ctx) => {
+        const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        const { rows } = await query("DELETE FROM sales_returns WHERE id=$1 AND status='DRAFT' RETURNING id", [id]);
+        if (!rows[0]) throw httpError('Only draft sales returns can be deleted', 400);
+        await logActivity(a.sub, 'DELETE_SALES_RETURN', 'sales_return', id);
+        return true;
       },
 
       approveSalesReturn: async (_p, { id }, ctx) => {
@@ -410,6 +454,46 @@ export function returnsResolvers() {
           await logActivity(a.sub, 'CREATE_PURCHASE_RETURN', 'purchase_return', pr.id, { returnNo });
           return mapPR((await client.query(`${PR_SELECT} WHERE pr.id=$1`, [pr.id])).rows[0]);
         });
+      },
+
+      updatePurchaseReturn: async (_p, { id, input }, ctx) => {
+        const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
+        const poId = str(input.poId);
+        const result = await withTransaction(async (client) => {
+          const current = (await client.query('SELECT status FROM purchase_returns WHERE id=$1 FOR UPDATE', [id])).rows[0];
+          if (!current) throw httpError('Purchase return not found', 404);
+          if (current.status !== 'DRAFT') throw httpError('Only draft returns can be edited', 400);
+          if (!(await client.query('SELECT id FROM vendors WHERE id=$1', [input.vendorId])).rows[0]) throw httpError('Vendor not found', 404);
+          if (!(await client.query('SELECT id FROM warehouses WHERE id=$1', [input.warehouseId])).rows[0]) throw httpError('Warehouse not found', 404);
+          let source = null;
+          if (poId) {
+            const po = (await client.query('SELECT vendor_id FROM purchase_orders WHERE id=$1', [poId])).rows[0];
+            if (!po) throw httpError('PO not found', 404);
+            if (po.vendor_id !== input.vendorId) throw httpError('That PO belongs to a different vendor', 400);
+            source = await purchaseSource(client, poId, id);
+          }
+          const { prepared, subTotal, taxTotal } = await prepareLines(client, input.lines, 'unitCost', source);
+          await client.query(`UPDATE purchase_returns SET po_id=$2, vendor_id=$3, warehouse_id=$4, reason=$5, notes=$6,
+            sub_total=$7, tax_total=$8, total_amount=$9 WHERE id=$1`,
+            [id, poId, input.vendorId, input.warehouseId, str(input.reason), str(input.notes), subTotal, taxTotal, round2(subTotal + taxTotal)]);
+          await client.query('DELETE FROM purchase_return_lines WHERE return_id=$1', [id]);
+          for (const { l, p, gst, lineTotal } of prepared) {
+            await client.query(`INSERT INTO purchase_return_lines (return_id, product_id, product_name, packing_size, batch_number, quantity, unit_cost, gst_percent, line_total)
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+              [id, l.productId, p.name, p.packing_size ?? null, str(l.batchNumber), l.quantity, l.unitCost, gst, lineTotal]);
+          }
+          return mapPR((await client.query(`${PR_SELECT} WHERE pr.id=$1`, [id])).rows[0]);
+        });
+        await logActivity(a.sub, 'UPDATE_PURCHASE_RETURN', 'purchase_return', id);
+        return result;
+      },
+
+      deletePurchaseReturn: async (_p, { id }, ctx) => {
+        const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
+        const { rows } = await query("DELETE FROM purchase_returns WHERE id=$1 AND status='DRAFT' RETURNING id", [id]);
+        if (!rows[0]) throw httpError('Only draft purchase returns can be deleted', 400);
+        await logActivity(a.sub, 'DELETE_PURCHASE_RETURN', 'purchase_return', id);
+        return true;
       },
 
       approvePurchaseReturn: async (_p, { id }, ctx) => {

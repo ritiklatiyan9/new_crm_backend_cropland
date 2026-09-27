@@ -41,7 +41,8 @@ export function validateGstr1Payload(p = {}) {
   if (!p.version) warnings.push('version missing (expected e.g. GST3.0.4)');
   if (p.gt == null) warnings.push('gt (aggregate turnover of preceding FY) not set');
   if (p.cur_gt == null) warnings.push('cur_gt (turnover April → period) not set');
-  const home = String(p.gstin || '').slice(0, 2);
+  // Supplier state from GSTIN; without it the POS-vs-heads check is skipped (the GSTIN error is raised anyway).
+  const home = /^\d{2}/.test(String(p.gstin || '')) ? String(p.gstin).slice(0, 2) : null;
 
   for (const party of p.b2b || []) {
     if (!validateGstin(party.ctin).valid) errors.push(`B2B: invalid recipient GSTIN ${party.ctin}`);
@@ -52,7 +53,7 @@ export function validateGstr1Payload(p = {}) {
       if (!String(inv.pos || '').match(/^\d{2}$/)) errors.push(`B2B ${inv.inum}: pos must be a 2-digit state code`);
       if (!['Y', 'N'].includes(inv.rchrg)) warnings.push(`B2B ${inv.inum}: rchrg should be Y/N`);
       for (const it of inv.itms || []) checkItem(it, `B2B ${inv.inum}`, errors, warnings);
-      checkHeads(inv.pos === home, inv.itms, `B2B ${inv.inum}`, errors);
+      if (home) checkHeads(inv.pos === home, inv.itms, `B2B ${inv.inum}`, errors);
     }
   }
   for (const party of p.b2cl || []) {
@@ -75,7 +76,7 @@ export function validateGstr1Payload(p = {}) {
       if (!['C', 'D'].includes(nt.ntty)) errors.push(`CDNR ${nt.nt_num}: ntty must be C/D`);
       if (!DMY_RE.test(nt.nt_dt || '')) errors.push(`CDNR ${nt.nt_num}: nt_dt must be dd-mm-yyyy`);
       for (const it of nt.itms || []) checkItem(it, `CDNR ${nt.nt_num}`, errors, warnings);
-      if (nt.pos) checkHeads(nt.pos === home, nt.itms, `CDNR ${nt.nt_num}`, errors);
+      if (home && nt.pos) checkHeads(nt.pos === home, nt.itms, `CDNR ${nt.nt_num}`, errors);
     }
   }
   // Table 12: split B2B / B2C (current), or the legacy single `data` list.

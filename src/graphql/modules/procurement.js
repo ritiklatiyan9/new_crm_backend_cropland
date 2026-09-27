@@ -146,6 +146,8 @@ export const procurementTypeDefs = /* GraphQL */ `
     deleteVendor(id: ID!): Boolean!
 
     createPurchaseOrder(input: CreatePOInput!): PurchaseOrder!
+    updatePurchaseOrder(id: ID!, input: CreatePOInput!): PurchaseOrder!
+    deletePurchaseOrder(id: ID!): Boolean!
     approvePurchaseOrder(id: ID!): PurchaseOrder!
     cancelPurchaseOrder(id: ID!): PurchaseOrder!
     receivePurchaseOrder(input: ReceivePOInput!): PurchaseOrder!
@@ -399,6 +401,66 @@ export function procurementResolvers() {
           const full = await client.query(`${PO_SELECT} WHERE po.id=$1`, [po.rows[0].id]);
           return mapPO(full.rows[0]);
         });
+      },
+
+      updatePurchaseOrder: async (_p, { id, input }, ctx) => {
+        const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
+        if (!input.lines?.length) throw httpError('PO must have at least one line', 400);
+        if (new Set(input.lines.map((l) => l.productId)).size !== input.lines.length) throw httpError('Combine duplicate products into one line', 400);
+        return withTransaction(async (client) => {
+          const po = (await client.query('SELECT * FROM purchase_orders WHERE id=$1 FOR UPDATE', [id])).rows[0];
+          if (!po) throw httpError('PO not found', 404);
+          if (po.status !== 'DRAFT') throw httpError('Only draft purchase orders can be edited', 400);
+          const vendor = (await client.query('SELECT id FROM vendors WHERE id=$1', [input.vendorId])).rows[0];
+          if (!vendor) throw httpError('Vendor not found', 404);
+          const products = new Map((await client.query('SELECT * FROM products WHERE id=ANY($1::uuid[])', [input.lines.map((l) => l.productId)])).rows.map((p) => [p.id, p]));
+          let subTotal = 0, taxTotal = 0;
+          const lines = input.lines.map((line) => {
+            const product = products.get(line.productId);
+            if (!product) throw httpError('Product not found', 404);
+            const priced = purchaseLine(line);
+            const gst = num(product.gst_percent ?? 0);
+            subTotal += priced.lineTotal;
+            taxTotal += roundGst(priced.lineTotal * gst / 100);
+            return { product, priced, gst };
+          });
+          const documentDetails = purchaseDocument(input.documentDetails ?? {});
+          subTotal = round2(subTotal); taxTotal = round2(taxTotal);
+          const total = round2(subTotal + (documentDetails.reverseCharge ? 0 : taxTotal));
+          await client.query(
+            `UPDATE purchase_orders SET vendor_id=$2, order_date=COALESCE($3::date,CURRENT_DATE), expected_date=$4,
+               sub_total=$5, tax_total=$6, total_amount=$7, notes=$8, document_details=$9, updated_at=now() WHERE id=$1`,
+            [id, input.vendorId, str(input.orderDate), str(input.expectedDate), subTotal, taxTotal, total, str(input.notes), JSON.stringify(documentDetails)],
+          );
+          await client.query('DELETE FROM purchase_order_lines WHERE po_id=$1', [id]);
+          for (const { product, priced, gst } of lines) {
+            await client.query(
+              `INSERT INTO purchase_order_lines (po_id, product_id, product_name, hsn_code, uom, packing_size, quantity, unit_cost, gst_percent, line_total, entry_details)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+              [id, product.id, product.name, priced.entryDetails.hsnCode || product.hsn_code, product.uom, product.packing_size ?? null,
+                priced.quantity, priced.unitCost, gst, priced.lineTotal, JSON.stringify(priced.entryDetails)],
+            );
+          }
+          await logActivity(a.sub, 'UPDATE_PO', 'purchase_order', id);
+          const full = await client.query(`${PO_SELECT} WHERE po.id=$1`, [id]);
+          return mapPO(full.rows[0]);
+        });
+      },
+
+      deletePurchaseOrder: async (_p, { id }, ctx) => {
+        const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
+        await withTransaction(async (client) => {
+          const po = (await client.query('SELECT status FROM purchase_orders WHERE id=$1 FOR UPDATE', [id])).rows[0];
+          if (!po) throw httpError('PO not found', 404);
+          if (po.status !== 'DRAFT') throw httpError('Only draft purchase orders can be deleted', 400);
+          const refs = await client.query(`SELECT EXISTS (SELECT 1 FROM goods_receipts WHERE po_id=$1
+            UNION ALL SELECT 1 FROM purchase_invoices WHERE po_id=$1
+            UNION ALL SELECT 1 FROM purchase_returns WHERE po_id=$1) AS used`, [id]);
+          if (refs.rows[0].used) throw httpError('This PO has transaction history and cannot be deleted', 400);
+          await client.query('DELETE FROM purchase_orders WHERE id=$1', [id]);
+        });
+        await logActivity(a.sub, 'DELETE_PO', 'purchase_order', id);
+        return true;
       },
 
       approvePurchaseOrder: async (_p, { id }, ctx) => {

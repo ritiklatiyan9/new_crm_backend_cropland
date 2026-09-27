@@ -65,8 +65,8 @@ export const gstTypeDefs = /* GraphQL */ `
 
 const EWB_THRESHOLD = 50000; // PRD §7.1: E-Way Bill required above ₹50,000
 const MODES = ['ROAD', 'RAIL', 'AIR', 'SHIP'];
-// Indian registration plate (e.g. MH12AB1234, DL1CAB1234) or a temporary TR number.
-const VEHICLE_RE = /^([A-Z]{2}\d{1,2}[A-Z]{0,3}\d{4}|TR[A-Z0-9]{6,12})$/;
+// Indian registration plate (e.g. MH12AB1234, DL1CAB1234), Bharat series (22BH1234AB) or a temporary TR number.
+const VEHICLE_RE = /^([A-Z]{2}\d{1,2}[A-Z]{0,3}\d{4}|\d{2}BH\d{4}[A-Z]{1,2}|TR[A-Z0-9]{6,12})$/;
 const normVehicle = (v) => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 /** NIC allows cancelling an IRN / e-way bill only within 24 hours of generation. */
 function assertWithin24h(at, what, alt) {
@@ -220,7 +220,7 @@ export function gstResolvers() {
         const cur = (await query("SELECT * FROM eway_bills WHERE invoice_id=$1 AND status='GENERATED'", [invoiceId])).rows[0];
         if (!cur) throw httpError('No active E-Way Bill for this invoice', 404);
         if (cur.valid_until && new Date(cur.valid_until) < new Date()) throw httpError('This E-Way Bill has expired — extend it on the EWB portal first', 400);
-        await gstProvider.updatePartB({ ewbNo: cur.ewb_no, vehicleNo: v, transportMode: cur.transport_mode, reason });
+        await gstProvider.updatePartB({ ewbNo: cur.ewb_no, vehicleNo: v, transportMode: 'ROAD', reason });
         const { rows } = await query(
           "UPDATE eway_bills SET vehicle_no=$2, transport_mode='ROAD', updated_at=now() WHERE id=$1 RETURNING *",
           [cur.id, v],

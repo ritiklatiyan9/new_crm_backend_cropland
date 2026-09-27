@@ -146,6 +146,8 @@ export const manufacturingTypeDefs = /* GraphQL */ `
     setProductStandardCost(productId: ID!, cost: Float!): Boolean!
 
     createProductionOrder(input: CreateProductionInput!): ProductionOrder!
+    updateProductionOrder(id: ID!, input: CreateProductionInput!): ProductionOrder!
+    deleteProductionOrder(id: ID!): Boolean!
     startProduction(id: ID!): ProductionOrder!
     completeProduction(input: CompleteProductionInput!): ProductionOrder!
     cancelProductionOrder(id: ID!): ProductionOrder!
@@ -456,6 +458,35 @@ export function manufacturingResolvers() {
           const full = await client.query(`${PO_SELECT} WHERE po.id=$1`, [po.id]);
           return mapPO(full.rows[0]);
         });
+      },
+
+      updateProductionOrder: async (_p, { id, input }, ctx) => {
+        const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
+        if (!(input.plannedQuantity > 0)) throw httpError('Quantity to produce must be greater than 0', 400);
+        const updated = await withTransaction(async (client) => {
+          const current = (await client.query('SELECT status FROM production_orders WHERE id=$1 FOR UPDATE', [id])).rows[0];
+          if (!current) throw httpError('Production order not found', 404);
+          if (current.status !== 'PLANNED') throw httpError('Only planned production orders can be edited', 400);
+          const product = (await client.query('SELECT id FROM products WHERE id=$1', [input.productId])).rows[0];
+          if (!product) throw httpError('Product not found', 404);
+          const warehouse = (await client.query('SELECT id FROM warehouses WHERE id=$1', [input.warehouseId])).rows[0];
+          if (!warehouse) throw httpError('Warehouse not found', 404);
+          const bom = (await client.query('SELECT id FROM bom WHERE product_id=$1 AND is_active ORDER BY version DESC LIMIT 1', [input.productId])).rows[0];
+          if (!bom) throw httpError('No active BOM for this product', 400);
+          await client.query('UPDATE production_orders SET product_id=$2, bom_id=$3, warehouse_id=$4, planned_quantity=$5, notes=$6 WHERE id=$1',
+            [id, input.productId, bom.id, input.warehouseId, input.plannedQuantity, str(input.notes)]);
+          return (await client.query(`${PO_SELECT} WHERE po.id=$1`, [id])).rows[0];
+        });
+        await logActivity(a.sub, 'UPDATE_PRODUCTION', 'production_order', id);
+        return mapPO(updated);
+      },
+
+      deleteProductionOrder: async (_p, { id }, ctx) => {
+        const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
+        const { rows } = await query("DELETE FROM production_orders WHERE id=$1 AND status='PLANNED' RETURNING id", [id]);
+        if (!rows[0]) throw httpError('Only planned production orders can be deleted', 400);
+        await logActivity(a.sub, 'DELETE_PRODUCTION', 'production_order', id);
+        return true;
       },
 
       startProduction: async (_p, { id }, ctx) => {

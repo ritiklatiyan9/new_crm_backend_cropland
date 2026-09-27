@@ -45,6 +45,7 @@ export const whatsappTypeDefs = /* GraphQL */ `
   }
   extend type Mutation {
     createWaCampaign(input: WaCampaignInput!): WaCampaign!
+    updateWaCampaign(id: ID!, input: WaCampaignInput!): WaCampaign!
     sendWaCampaign(id: ID!): WaCampaign!
     deleteWaCampaign(id: ID!): Boolean!
   }
@@ -99,6 +100,7 @@ export function whatsappResolvers() {
       createWaCampaign: async (_p, { input }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
         if (!['FARMERS', 'DISTRIBUTORS', 'ALL'].includes(input.audience)) throw httpError('Invalid audience', 400);
+        if (!input.name?.trim() || !input.body?.trim()) throw httpError('Campaign name and message are required', 400);
         const type = ['TEXT', 'PRODUCT', 'ADVISORY'].includes(input.messageType) ? input.messageType : 'TEXT';
         const recipients = await recipientsFor(input.audience);
         const no = `WA-${String((await query("SELECT nextval('wacamp_seq') n")).rows[0].n).padStart(5, '0')}`;
@@ -109,6 +111,23 @@ export function whatsappResolvers() {
         );
         await logActivity(a.sub, 'CREATE_WA_CAMPAIGN', 'whatsapp_campaign', rows[0].id, { no, recipients: recipients.length });
         return mapCampaign({ ...rows[0], product_name: null });
+      },
+
+      updateWaCampaign: async (_p, { id, input }, ctx) => {
+        const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN', 'SALES');
+        if (!['FARMERS', 'DISTRIBUTORS', 'ALL'].includes(input.audience)) throw httpError('Invalid audience', 400);
+        if (!input.name?.trim() || !input.body?.trim()) throw httpError('Campaign name and message are required', 400);
+        const type = ['TEXT', 'PRODUCT', 'ADVISORY'].includes(input.messageType) ? input.messageType : 'TEXT';
+        const recipients = await recipientsFor(input.audience);
+        const { rows } = await query(
+          `UPDATE whatsapp_campaigns SET name=$2, audience=$3, message_type=$4, body=$5, product_id=$6,
+            image_url=$7, recipients_count=$8 WHERE id=$1 AND status='DRAFT' RETURNING *`,
+          [id, input.name.trim(), input.audience, type, input.body.trim(), input.productId ?? null, input.imageUrl ?? null, recipients.length],
+        );
+        if (!rows[0]) throw httpError('Only draft campaigns can be edited', 400);
+        await logActivity(a.sub, 'UPDATE_WA_CAMPAIGN', 'whatsapp_campaign', id);
+        const full = await query(`${SELECT} WHERE c.id=$1`, [id]);
+        return mapCampaign(full.rows[0]);
       },
 
       sendWaCampaign: async (_p, { id }, ctx) => {
@@ -138,8 +157,8 @@ export function whatsappResolvers() {
 
       deleteWaCampaign: async (_p, { id }, ctx) => {
         const a = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
-        const { rowCount } = await query('DELETE FROM whatsapp_campaigns WHERE id=$1', [id]);
-        if (!rowCount) throw httpError('Campaign not found', 404);
+        const { rowCount } = await query("DELETE FROM whatsapp_campaigns WHERE id=$1 AND status='DRAFT'", [id]);
+        if (!rowCount) throw httpError('Only draft campaigns can be deleted', 400);
         await logActivity(a.sub, 'DELETE_WA_CAMPAIGN', 'whatsapp_campaign', id);
         return true;
       },

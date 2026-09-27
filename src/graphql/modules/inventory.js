@@ -97,6 +97,8 @@ export const inventoryTypeDefs = /* GraphQL */ `
 
   extend type Mutation {
     createWarehouse(input: WarehouseInput!): Warehouse!
+    updateWarehouse(id: ID!, input: WarehouseInput!): Warehouse!
+    deleteWarehouse(id: ID!): Boolean!
     stockIn(input: StockInInput!): StockLevel!
     stockAdjust(input: StockAdjustInput!): StockLevel!
   }
@@ -251,6 +253,43 @@ export function inventoryResolvers() {
         );
         await logActivity(actor.sub, 'CREATE_WAREHOUSE', 'warehouse', rows[0].id);
         return mapWarehouse(rows[0]);
+      },
+
+      updateWarehouse: async (_p, { id, input }, ctx) => {
+        const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
+        const name = input.name?.trim();
+        if (!name) throw httpError('Warehouse name is required', 400);
+        const { rows } = await query(
+          `UPDATE warehouses SET name=$2, code=$3, branch_id=$4 WHERE id=$1 RETURNING *`,
+          [id, name, input.code?.trim() || null, input.branchId || null],
+        );
+        if (!rows[0]) throw httpError('Warehouse not found', 404);
+        await logActivity(actor.sub, 'UPDATE_WAREHOUSE', 'warehouse', id);
+        return mapWarehouse(rows[0]);
+      },
+
+      deleteWarehouse: async (_p, { id }, ctx) => {
+        const actor = assertRole(ctx, 'SUPER_ADMIN', 'ADMIN', 'SUB_ADMIN');
+        // Stock and transaction history must never disappear through FK cascades.
+        await withTransaction(async (client) => {
+          const warehouse = await client.query('SELECT id FROM warehouses WHERE id=$1 FOR UPDATE', [id]);
+          if (!warehouse.rows[0]) throw httpError('Warehouse not found', 404);
+          const { rows } = await client.query(
+            `SELECT EXISTS (
+            SELECT 1 FROM stock_levels WHERE warehouse_id=$1
+            UNION ALL SELECT 1 FROM stock_movements WHERE warehouse_id=$1
+            UNION ALL SELECT 1 FROM goods_receipts WHERE warehouse_id=$1
+            UNION ALL SELECT 1 FROM party_sales WHERE warehouse_id=$1
+            UNION ALL SELECT 1 FROM production_orders WHERE warehouse_id=$1
+            UNION ALL SELECT 1 FROM purchase_returns WHERE warehouse_id=$1
+            UNION ALL SELECT 1 FROM sales_returns WHERE warehouse_id=$1
+            ) AS used`, [id],
+          );
+          if (rows[0].used) throw httpError('This warehouse has stock or transaction history and cannot be deleted', 400);
+          await client.query('DELETE FROM warehouses WHERE id=$1', [id]);
+        });
+        await logActivity(actor.sub, 'DELETE_WAREHOUSE', 'warehouse', id);
+        return true;
       },
 
       stockIn: async (_p, { input }, ctx) => {
